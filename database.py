@@ -1,9 +1,11 @@
 """Database models and operations for cars."""
 
 import os
+import random
 import asyncpg
 from typing import List, Optional, Dict, Any
 from dataclasses import dataclass
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -191,14 +193,20 @@ class CarDatabase:
                 parts.append(car.variant)
             car_name = " ".join(parts) if parts else f"Car #{car_id}"
         
+        # Generate confirmation_id for test drive booking
+        timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+        random_suffix = random.randint(1000, 9999)
+        confirmation_id = f"TD{timestamp}{random_suffix}"
+        
         async with self._pool.acquire() as conn:
             booking_id = await conn.fetchval(
                 """
                 INSERT INTO test_drive_bookings 
-                (customer_name, customer_phone, vehicle_id, car_name, location, status, notes, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+                (confirmation_id, customer_name, customer_phone, vehicle_id, car_name, location, status, notes, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
                 RETURNING id
                 """,
+                confirmation_id,
                 user_name,  # customer_name
                 phone_number,  # customer_phone
                 str(car_id),  # vehicle_id (character varying)
@@ -263,13 +271,19 @@ class CarDatabase:
                 return booking_id
             except Exception:
                 # Fallback: use test_drive_bookings table
+                # Generate confirmation_id for service booking
+                timestamp = datetime.now().strftime('%Y%m%d%H%M%S')
+                random_suffix = random.randint(1000, 9999)
+                confirmation_id = f"SB{timestamp}{random_suffix}"
+                
                 booking_id = await conn.fetchval(
                     """
                     INSERT INTO test_drive_bookings 
-                    (customer_name, customer_phone, vehicle_id, car_name, location, status, notes, created_at, updated_at)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, NOW(), NOW())
+                    (confirmation_id, customer_name, customer_phone, vehicle_id, car_name, location, status, notes, created_at, updated_at)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
                     RETURNING id
                     """,
+                    confirmation_id,
                     customer_name,
                     phone_number,
                     None,  # vehicle_id
