@@ -1,0 +1,44 @@
+================================================================================
+AUTOSHERPA BOT TEST MATRIX REPORT
+================================================================================
+
+Test Date: 2025-11-17T11:11:21.510540
+
+
+BROWSE CAR FLOW
+--------------------------------------------------------------------------------
+Total Conversations: 100
+Completed: 0 (0.00%)
+Total Steps: 572
+Average Steps: 5.72
+Total Errors: 0
+Verified Responses: 545 (95.28%)
+
+CAR VALUATION FLOW
+--------------------------------------------------------------------------------
+Total Conversations: 100
+Completed: 33 (33.00%)
+Total Steps: 600
+Average Steps: 6.00
+Total Errors: 0
+Verified Responses: 600 (100.00%)
+
+EMI FLOW
+--------------------------------------------------------------------------------
+Total Conversations: 100
+Completed: 38 (38.00%)
+Total Steps: 300
+Average Steps: 3.00
+Total Errors: 0
+Verified Responses: 300 (100.00%)
+
+SERVICE BOOKING FLOW
+--------------------------------------------------------------------------------
+Total Conversations: 100
+Completed: 0 (0.00%)
+Total Steps: 900
+Average Steps: 9.00
+Total Errors: 0
+Verified Responses: 900 (100.00%)
+
+================================================================================

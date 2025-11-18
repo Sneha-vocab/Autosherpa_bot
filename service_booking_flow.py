@@ -164,6 +164,23 @@ async def handle_service_booking_flow(
     """Handle the service booking flow with intelligent message analysis."""
     state = conversation_manager.get_state(user_id)
     
+    # Check for exit/back to main menu (check early, but allow option 4 in showing_services step)
+    message_lower = message.lower().strip()
+    # Only check for exit if not in showing_services step (where option 4 is handled)
+    if state and state.step != "showing_services":
+        exit_keywords = ["back", "menu", "main menu", "exit", "cancel", "quit", "stop", "done"]
+        if any(keyword in message_lower for keyword in exit_keywords):
+            conversation_manager.clear_state(user_id)
+            return (
+                "Sure! How can I help you today? 😊\n\n"
+                "You can:\n"
+                "• Browse used cars\n"
+                "• Get car valuation\n"
+                "• Calculate EMI\n"
+                "• Book a service\n\n"
+                "What would you like to do?"
+            )
+    
     # Get available brands from database
     available_brands = await get_brands_from_db()
     

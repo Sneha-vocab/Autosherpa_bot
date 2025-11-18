@@ -255,7 +255,8 @@ def format_valuation_result(valuation_data: Dict[str, Any], brand: str, model: s
         f"For a more accurate valuation, we recommend a physical inspection.\n\n"
         f"Would you like to:\n"
         f"1️⃣ Value another car\n"
-        f"2️⃣ Get more details about this valuation"
+        f"2️⃣ Get more details about this valuation\n"
+        f"3️⃣ Back to main menu"
     )
     
     return message
@@ -268,6 +269,21 @@ async def handle_car_valuation_flow(
 ) -> str:
     """Handle the car valuation flow with intelligent message analysis."""
     state = conversation_manager.get_state(user_id)
+    
+    # Check for exit/back to main menu
+    message_lower = message.lower().strip()
+    exit_keywords = ["back", "menu", "main menu", "exit", "cancel", "quit", "stop", "done"]
+    if any(keyword in message_lower for keyword in exit_keywords):
+        conversation_manager.clear_state(user_id)
+        return (
+            "Sure! How can I help you today? 😊\n\n"
+            "You can:\n"
+            "• Browse used cars\n"
+            "• Get car valuation\n"
+            "• Calculate EMI\n"
+            "• Book a service\n\n"
+            "What would you like to do?"
+        )
     
     # Get available brands and fuel types from database
     available_brands = await get_brands_from_db()
@@ -409,8 +425,14 @@ async def handle_car_valuation_flow(
                 condition=condition
             )
             
+            # Ensure values are not empty strings
+            brand = brand.strip() if brand and isinstance(brand, str) else brand
+            model = model.strip() if model and isinstance(model, str) else model
+            fuel_type = fuel_type.strip() if fuel_type and isinstance(fuel_type, str) else fuel_type
+            condition = condition.strip() if condition and isinstance(condition, str) else condition
+            
             # Check what's missing
-            if not brand:
+            if not brand or brand == "":
                 try:
                     response = await generate_valuation_response(
                         message=message,
@@ -428,7 +450,7 @@ async def handle_car_valuation_flow(
                     brands_list = ", ".join(available_brands[:5]) if available_brands else ""
                     return f"Which brand is your car? (e.g., {brands_list})" if brands_list else "Which brand is your car?"
             
-            elif not model:
+            elif not model or model == "":
                 try:
                     response = await generate_valuation_response(
                         message=message,
@@ -445,7 +467,7 @@ async def handle_car_valuation_flow(
                     print(f"Error generating response: {e}")
                     return f"What's the model of your {brand} car?"
             
-            elif not year:
+            elif not year or year == 0:
                 try:
                     response = await generate_valuation_response(
                         message=message,
@@ -462,7 +484,7 @@ async def handle_car_valuation_flow(
                     print(f"Error generating response: {e}")
                     return f"What year was your {brand} {model} manufactured?"
             
-            elif not fuel_type:
+            elif not fuel_type or fuel_type == "":
                 try:
                     response = await generate_valuation_response(
                         message=message,
@@ -480,7 +502,7 @@ async def handle_car_valuation_flow(
                     fuel_list = ", ".join(available_fuel_types)
                     return f"What's the fuel type? (e.g., {fuel_list})"
             
-            elif not condition:
+            elif not condition or condition == "":
                 try:
                     response = await generate_valuation_response(
                         message=message,
@@ -499,8 +521,17 @@ async def handle_car_valuation_flow(
             
             else:
                 # All information collected, calculate valuation
-                if not model:
+                # Ensure we have valid values
+                if not brand or not year or not fuel_type or not condition:
+                    return "I need all the information to calculate the valuation. Please provide brand, year, fuel type, and condition."
+                
+                if not model or model == "":
                     model = "Unknown Model"  # Default if model not provided
+                
+                # Validate year is reasonable
+                current_year = datetime.now().year
+                if year < 1990 or year > current_year:
+                    return f"Please provide a valid year between 1990 and {current_year}."
                 
                 try:
                     valuation_data = await calculate_car_valuation(
@@ -511,14 +542,27 @@ async def handle_car_valuation_flow(
                         condition=condition
                     )
                     
+                    # Verify valuation was calculated successfully
+                    if not valuation_data or valuation_data.get("final_valuation") is None:
+                        print(f"Valuation calculation returned None or error: {valuation_data}")
+                        return (
+                            "I encountered an issue calculating the valuation. "
+                            "Please try again or contact us for a detailed valuation."
+                        )
+                    
                     # Store valuation in state
                     conversation_manager.update_data(user_id, valuation=valuation_data)
                     conversation_manager.update_state(user_id, step="showing_valuation")
                     
-                    return format_valuation_result(valuation_data, brand, model, year, fuel_type, condition)
+                    # Always return the formatted valuation result
+                    result = format_valuation_result(valuation_data, brand, model, year, fuel_type, condition)
+                    print(f"Valuation calculated successfully: ₹{valuation_data.get('final_valuation'):,.0f}")
+                    return result
                     
                 except Exception as e:
                     print(f"Error calculating valuation: {e}")
+                    import traceback
+                    traceback.print_exc()
                     return f"I encountered an issue calculating the valuation. Please try again later. Error: {str(e)}"
         
         except CarValuationAnalysisError as e:
@@ -540,20 +584,41 @@ async def handle_car_valuation_flow(
                 return f"What year was your {brand} {model} manufactured?"
             elif not fuel_type:
                 return "What's the fuel type?"
-            elif not condition:
+            elif not condition or condition == "":
                 return "How would you describe the condition?"
             else:
                 # All information collected
-                if not model:
+                if not brand or not year or not fuel_type or not condition:
+                    return "I need all the information to calculate the valuation. Please provide brand, year, fuel type, and condition."
+                
+                if not model or model == "":
                     model = "Unknown Model"
+                
+                # Validate year
+                current_year = datetime.now().year
+                if year < 1990 or year > current_year:
+                    return f"Please provide a valid year between 1990 and {current_year}."
                 
                 try:
                     valuation_data = await calculate_car_valuation(brand, model, year, fuel_type, condition)
+                    
+                    # Verify valuation was calculated successfully
+                    if not valuation_data or valuation_data.get("final_valuation") is None:
+                        print(f"Valuation calculation returned None or error: {valuation_data}")
+                        return (
+                            "I encountered an issue calculating the valuation. "
+                            "Please try again or contact us for a detailed valuation."
+                        )
+                    
                     conversation_manager.update_data(user_id, valuation=valuation_data)
                     conversation_manager.update_state(user_id, step="showing_valuation")
-                    return format_valuation_result(valuation_data, brand, model, year, fuel_type, condition)
+                    result = format_valuation_result(valuation_data, brand, model, year, fuel_type, condition)
+                    print(f"Valuation calculated successfully (fallback): ₹{valuation_data.get('final_valuation'):,.0f}")
+                    return result
                 except Exception as e:
                     print(f"Error calculating valuation: {e}")
+                    import traceback
+                    traceback.print_exc()
                     return f"I encountered an issue calculating the valuation. Please try again later. Error: {str(e)}"
     
     elif state.step == "showing_valuation":
@@ -565,6 +630,19 @@ async def handle_car_valuation_flow(
             conversation_manager.update_state(user_id, step="collecting_info")
             conversation_manager.update_data(user_id, brand=None, model=None, year=None, fuel_type=None, condition=None, valuation=None)
             return "Great! Let's value another car! 🚗\n\nWhich brand is your car?"
+        
+        elif "3" in message_lower or "back" in message_lower or "menu" in message_lower or "main menu" in message_lower:
+            # Back to main menu
+            conversation_manager.clear_state(user_id)
+            return (
+                "Sure! How can I help you today? 😊\n\n"
+                "You can:\n"
+                "• Browse used cars\n"
+                "• Get car valuation\n"
+                "• Calculate EMI\n"
+                "• Book a service\n\n"
+                "What would you like to do?"
+            )
         
         elif "2" in message_lower or "details" in message_lower or "more" in message_lower:
             # More details
@@ -607,10 +685,10 @@ async def handle_car_valuation_flow(
                 return response
             except CarValuationAnalysisError as e:
                 print(f"Analysis error in showing_valuation: {e}")
-                return "Would you like to:\n1️⃣ Value another car\n2️⃣ Get more details about this valuation"
+                return "Would you like to:\n1️⃣ Value another car\n2️⃣ Get more details about this valuation\n3️⃣ Back to main menu"
             except Exception as e:
                 print(f"Error generating response: {e}")
-                return "Would you like to:\n1️⃣ Value another car\n2️⃣ Get more details about this valuation"
+                return "Would you like to:\n1️⃣ Value another car\n2️⃣ Get more details about this valuation\n3️⃣ Back to main menu"
     
     return "I'm not sure how to help with that. Could you please rephrase?"
 

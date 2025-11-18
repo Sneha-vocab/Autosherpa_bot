@@ -149,6 +149,21 @@ async def handle_browse_car_flow(
     """Handle the browse used car flow with intelligent message analysis."""
     state = conversation_manager.get_state(user_id)
     
+    # Check for exit/back to main menu
+    message_lower = message.lower().strip()
+    exit_keywords = ["back", "menu", "main menu", "exit", "cancel", "quit", "stop", "done"]
+    if any(keyword in message_lower for keyword in exit_keywords):
+        conversation_manager.clear_state(user_id)
+        return (
+            "Sure! How can I help you today? 😊\n\n"
+            "You can:\n"
+            "• Browse used cars\n"
+            "• Get car valuation\n"
+            "• Calculate EMI\n"
+            "• Book a service\n\n"
+            "What would you like to do?"
+        )
+    
     # Get available brands and types from database
     available_brands = await get_brands_from_db()
     available_types = await get_car_types_from_db()
