@@ -81,6 +81,20 @@ class ConversationManager:
         state.data.update(data)
         self.set_state(user_id, state)
         return state
+    
+    def ensure_flow(self, user_id: str, flow_name: str, step: str = "start") -> ConversationState:
+        """
+        Ensure the user has a state for the given flow.
+        If state exists, only update flow_name and step, keep existing data.
+        """
+        state = self.get_state(user_id)
+        if not state:
+            state = ConversationState(user_id=user_id, flow_name=flow_name, step=step)
+        else:
+            state.flow_name = flow_name
+            state.step = step
+        self.set_state(user_id, state)
+        return state
 
 
 # Global conversation manager instance

@@ -16,9 +16,12 @@ from intent_service import (
     generate_response,
     is_car_related,
 )
-from conversation_state import conversation_manager
+from conversation_state import conversation_manager,ConversationState
 from browse_car_flow import handle_browse_car_flow
 from database import car_db
+from route import llm_route
+
+
 
 # Load environment variables
 load_dotenv()
@@ -71,7 +74,7 @@ async def verify_webhook(
     hub_mode: Optional[str] = None,
     hub_challenge: Optional[str] = None,
     hub_verify_token: Optional[str] = None
-):
+ ):
     """
     Webhook verification endpoint
     Meta will call this endpoint to verify your webhook during setup
@@ -261,224 +264,98 @@ async def handle_status_update(status: dict):
 
 async def process_text_message(from_number: str, text: str, message_id: str):
     """
-    Process incoming text messages with intent extraction and response generation.
-    Handles both car-related queries and out-of-context questions gracefully.
-    Routes to specific flows (like browse_car) when appropriate.
+    Handles incoming WhatsApp text messages.
+    Preserves memory across flows.
     """
+
     try:
-        # Check if user is in an active conversation flow
+        # STEP 0 — CHECK IF USER IS ALREADY IN A FLOW
         state = conversation_manager.get_state(from_number)
-        if state and state.flow_name == "browse_car":
-            # User is in browse car flow, handle it directly
+        if state:
+            flow = state.flow_name
             try:
-                response_text = await handle_browse_car_flow(from_number, text, None)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Browse car flow response sent to {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error in browse car flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        if state and state.flow_name == "car_valuation":
-            # User is in car valuation flow, handle it directly
-            try:
-                from car_valuation_flow import handle_car_valuation_flow
-                response_text = await handle_car_valuation_flow(from_number, text, None)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Car valuation flow response sent to {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error in car valuation flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        if state and state.flow_name == "emi":
-            # User is in EMI flow, handle it directly
-            try:
-                from emi_flow import handle_emi_flow
-                response_text = await handle_emi_flow(from_number, text, None)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"EMI flow response sent to {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error in EMI flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        if state and state.flow_name == "service_booking":
-            # User is in service booking flow, handle it directly
-            try:
-                from service_booking_flow import handle_service_booking_flow
-                response_text = await handle_service_booking_flow(from_number, text, None)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Service booking flow response sent to {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error in service booking flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 1: Extract intent from the message
-        intent_result: IntentResult = await extract_intent(text)
-        print("Intent extraction result:")
-        print(f"  Intent: {intent_result.intent}")
-        print(f"  Summary: {intent_result.summary}")
-        print(f"  Confidence: {intent_result.confidence:.2f}")
-        if intent_result.entities:
-            print(f"  Entities: {intent_result.entities}")
-        
-        # Step 2: Check for service booking intent
-        intent_lower = intent_result.intent.lower()
-        text_lower = text.lower()
-        
-        service_keywords = ["book service", "service booking", "book a service", "service", "servicing", "repair", "maintenance", "book"]
-        is_service_intent = (
-            "service" in intent_lower or
-            "booking" in intent_lower or
-            "book" in intent_lower or
-            "repair" in intent_lower or
-            "servicing" in intent_lower or
-            any(keyword in text_lower for keyword in service_keywords)
-        )
-        
-        if is_service_intent:
-            # Route to service booking flow
-            try:
-                from service_booking_flow import handle_service_booking_flow
-                response_text = await handle_service_booking_flow(from_number, text, intent_result)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Service booking flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating service booking flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 3: Check for EMI intent
-        emi_keywords = ["emi", "loan", "installment", "finance", "down payment", "monthly payment", "monthly emi", "calculate emi"]
-        is_emi_intent = (
-            "emi" in intent_lower or
-            "loan" in intent_lower or
-            "installment" in intent_lower or
-            "finance" in intent_lower or
-            any(keyword in text_lower for keyword in emi_keywords)
-        )
-        
-        if is_emi_intent:
-            # Route to EMI flow
-            try:
-                from emi_flow import handle_emi_flow
-                response_text = await handle_emi_flow(from_number, text, intent_result)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"EMI flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating EMI flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 4: Check for car_valuation intent
-        valuation_keywords = ["value", "valuation", "price", "worth", "resale", "sell", "how much", "estimate", "appraise"]
-        is_valuation_intent = (
-            "value" in intent_lower or
-            "valuation" in intent_lower or
-            "price" in intent_lower or
-            "worth" in intent_lower or
-            any(keyword in text_lower for keyword in valuation_keywords)
-        )
-        
-        if is_valuation_intent:
-            # Route to car valuation flow
-            try:
-                from car_valuation_flow import handle_car_valuation_flow
-                response_text = await handle_car_valuation_flow(from_number, text, intent_result)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Car valuation flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating car valuation flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 5: Check for browse_car intent
-        browse_keywords = ["browse", "buy", "purchase", "looking for", "want to buy", "search", "find car"]
-        is_browse_intent = (
-            "browse" in intent_lower or
-            "buy" in intent_lower or
-            "purchase" in intent_lower or
-            any(keyword in text_lower for keyword in browse_keywords)
-        )
-        
-        if is_browse_intent:
-            # Route to browse car flow
-            try:
-                response_text = await handle_browse_car_flow(from_number, text, intent_result)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Browse car flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating browse car flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 6: Determine if the query is car-related
-        car_related = is_car_related(intent_result, text)
-        print(f"  Car-related: {car_related}")
-        
-        # Step 7: Generate human-like response based on intent
-        try:
-            response_text = await generate_response(
-                original_message=text,
-                intent_result=intent_result,
-                is_car_related=car_related
-            )
-            print(f"Generated response: {response_text}")
-            
-            # Step 8: Send the response back to the user
-            await send_whatsapp_message(from_number, response_text)
-            print(f"Response sent to {from_number}")
-            
-        except ResponseGenerationError as exc:
-            print(f"Response generation failed: {exc}")
-            # Fallback response for out-of-context questions
-            if not car_related:
-                fallback = (
-                    "I appreciate your question! I'm specifically here to help "
-                    "with car-related queries like maintenance, repairs, insurance, "
-                    "or vehicle information. How can I assist you with your car today?"
-                )
+                if flow == "browse_used_cars":
+                    response = await handle_browse_car_flow(from_number, text)
+                elif flow == "car_validation":
+                    from car_validation_flow import handle_car_validation_flow
+                    response = await handle_car_validation_flow(from_number, text)
+                elif flow == "emi_options":
+                    from emi_flow import handle_emi_flow
+                    response = await handle_emi_flow(from_number, text)
+                elif flow == "service_booking":
+                    from service_booking_flow import handle_service_booking_flow
+                    response = await handle_service_booking_flow(from_number, text)
+                else:
+                    response = None
+
+                if response:
+                    await send_whatsapp_message(from_number, response)
+                    return
+
+            except Exception as exc:
+                print(f"[FLOW ERROR] Error inside {flow}: {exc}")
+                # fallback to LLM routing
+
+        # STEP 1 — RUN LLM ROUTER
+        route = await llm_route(text)
+        intent = route["intent"]
+        confidence = route["confidence"]
+
+        print(f"Intent routing result: Intent={intent}, Confidence={confidence}")
+
+        # STEP 2 — MAP INTENT TO FLOW
+        FLOW_MAP = {
+            "browse_used_cars": "browse_used_cars",
+            "car_validation": "car_validation",
+            "emi_options": "emi_options",
+            "service_booking": "service_booking",
+        }
+        mapped_flow = FLOW_MAP.get(intent)
+
+        if mapped_flow:
+            # Use existing state if available, else initialize safely
+            state = conversation_manager.get_state(from_number)
+            if state:
+                # update flow and step, keep existing data
+                state.flow_name = mapped_flow
+                state.step = "start"
+                conversation_manager.set_state(from_number, state)
             else:
-                fallback = (
-                    "I'm having trouble processing that right now. Could you "
-                    "please rephrase your car-related question? I'm here to help!"
+                # first time
+                conversation_manager.set_state(
+                    from_number,
+                    ConversationState(
+                        user_id=from_number,
+                        flow_name=mapped_flow,
+                        step="start",
+                        data={}  # first initialization only
+                    )
                 )
-            await send_whatsapp_message(from_number, fallback)
-            print(f"Fallback response sent to {from_number}")
-            
-    except IntentExtractionError as exc:
-        print(f"Intent extraction failed: {exc}")
-        # Fallback for intent extraction failures
-        fallback = (
-            "I'm having some technical difficulties understanding your message. "
-            "Could you please rephrase your question about cars? I'm here to help!"
-        )
-        await send_whatsapp_message(from_number, fallback)
-        
-    except ValueError as exc:
-        print(f"Invalid message for intent extraction: {exc}")
-        # Handle empty or invalid messages
-        fallback = (
-            "I didn't quite catch that. Could you please send me a message "
-            "about your car? I'm here to help with car-related questions!"
-        )
-        await send_whatsapp_message(from_number, fallback)
-    
+
+            # Dispatch to flow handler
+            if mapped_flow == "browse_used_cars":
+                response = await handle_browse_car_flow(from_number, text)
+            elif mapped_flow == "car_validation":
+                from car_validation_flow import handle_car_validation_flow
+                response = await handle_car_validation_flow(from_number, text)
+            elif mapped_flow == "emi_options":
+                from emi_flow import handle_emi_flow
+                response = await handle_emi_flow(from_number, text)
+            elif mapped_flow == "service_booking":
+                from service_booking_flow import handle_service_booking_flow
+                response = await handle_service_booking_flow(from_number, text)
+
+            await send_whatsapp_message(from_number, response)
+            return
+
+        # STEP 3 — NORMAL / SMALL TALK
+        response = await handle_normal_intent(text)
+        await send_whatsapp_message(from_number, response)
+
     except Exception as exc:
-        print(f"Unexpected error processing message: {exc}")
-        import traceback
-        traceback.print_exc()
-        # Generic fallback for any other errors
-        fallback = (
-            "I encountered an issue processing your message. Please try again "
-            "with a car-related question, and I'll do my best to help!"
-        )
-        try:
-            await send_whatsapp_message(from_number, fallback)
-        except Exception as send_exc:
-            print(f"Failed to send fallback message: {send_exc}")
+        print(f"[FATAL ERROR] {exc}")
+        fallback = "Something went wrong, but I'm here to help with your car! 🚗"
+        await send_whatsapp_message(from_number, fallback)
 
 
 async def process_image_message(from_number: str, image_id: str, caption: str, message_id: str):
@@ -489,13 +366,45 @@ async def process_image_message(from_number: str, image_id: str, caption: str, m
     pass
 
 
+async def handle_normal_intent(text: str) -> str:
+
+    prompt = f"""
+    You are AutoSherpa, a friendly car assistant.
+
+    If the user's message is a greeting:
+    - Respond warmly
+    - Then gently guide them to ask something car-related
+    - Keep response under 15 words
+
+    If the message is unrelated to cars:
+    - Politely acknowledge it
+    - Then guide them back to car-related topics
+    - Keep it under 10-15 words
+
+    User message: "{text}"
+    """
+
+    import httpx, os
+    api_key = os.getenv("GOOGLE_API_KEY")
+    url = "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent"
+
+    response = httpx.post(
+        url,
+        params={"key": api_key},
+        json={"contents": [{"parts": [{"text": prompt}]}]},
+        timeout=8,
+    )
+
+    return response.json()["candidates"][0]["content"]["parts"][0]["text"]
+
+
 # Optional: Helper function to send WhatsApp messages via Meta API
 async def send_whatsapp_message(
     to: str,
     message: str,
     phone_number_id: Optional[str] = None,
     access_token: Optional[str] = None
-):
+ ):
     """
     Send a WhatsApp message using Meta's API
     This is a helper function - you'll need to implement the actual API call

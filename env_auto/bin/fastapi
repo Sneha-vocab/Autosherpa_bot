@@ -1,0 +1,8 @@
+#!/media/vocab/Vocab2DevExHDD1/kashyap_whatsapp_bot/Autosherpa_bot/env_auto/bin/python
+# -*- coding: utf-8 -*-
+import re
+import sys
+from fastapi.cli import main
+if __name__ == '__main__':
+    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
+    sys.exit(main())

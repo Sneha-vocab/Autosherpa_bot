@@ -42,7 +42,7 @@ class IntentResult:
         clamped_confidence = max(0.0, min(1.0, numeric_confidence))
 
         return cls(
-            intent=payload.get("intent", "unknown"),
+            intent=payload.get("intent", "normal") or "normal",
             summary=payload.get("summary", ""),
             confidence=clamped_confidence,
             entities=payload.get("entities", {}) or {},
@@ -55,7 +55,7 @@ async def extract_intent(
     model: Optional[str] = None,
     timeout: float = 12.0,
     client: Optional[httpx.AsyncClient] = None,
-) -> IntentResult:
+ ) -> IntentResult:
     """Extract intent for the provided message text using Gemini.
 
     Args:
@@ -144,17 +144,16 @@ async def extract_intent(
     return IntentResult.from_payload(parsed)
 
 
-def _build_prompt(message: str) -> str:
-    return (
-        "You are a precise intent extraction service. "
-        "Given the following user message, identify the user's intent, "
-        "summarise it in a single sentence, estimate a confidence score between 0 and 1, "
-        "and extract key entities as a JSON dictionary.\n\n"
-        "Return your answer as compact JSON with exactly the keys: intent (string), "
-        "summary (string), confidence (float between 0 and 1), entities (object mapping).\n\n"
-        f"User message: {message}"
-    )
-
+# def _build_prompt(message: str) -> str:
+#     return (
+#         "You are a precise intent extraction service. "
+#         "Given the following user message, identify the user's intent, "
+#         "summarise it in a single sentence, estimate a confidence score between 0 and 1, "
+#         "and extract key entities as a JSON dictionary.\n\n"
+#         "Return your answer as compact JSON with exactly the keys: intent (string), "
+#         "summary (string), confidence (float between 0 and 1), entities (object mapping).\n\n"
+#         f"User message: {message}"
+#     )
 
 def extract_intent_sync(message_text: str, **kwargs: Any) -> IntentResult:
     """Convenience wrapper for synchronous contexts."""
@@ -223,7 +222,7 @@ async def generate_response(
     model: Optional[str] = None,
     timeout: float = 12.0,
     client: Optional[httpx.AsyncClient] = None,
-) -> str:
+ ) -> str:
     """Generate a human-like response based on intent and context.
     
     Args:
@@ -254,17 +253,18 @@ async def generate_response(
             "The user has asked a car-related question. Provide a warm, "
             "professional, and helpful response. Be conversational and human-like. "
             "If you need more information, ask follow-up questions naturally. "
-            "Keep responses concise (2-3 sentences max)."
+            "Keep responses concise (10-15 words max)."
         )
     else:
         system_prompt = (
-            "You are a helpful and friendly car service assistant. "
-            "The user has asked a question that is NOT related to cars. "
-            "Politely redirect them back to car-related topics in a warm, "
-            "understanding manner. Acknowledge their question but gently guide "
-            "them to how you can help with car-related queries. "
-            "Be empathetic and friendly, not robotic. Keep it brief (2-3 sentences max)."
+            "You are a warm, friendly car assistant. For any user message that is "
+            "NOT about cars, first acknowledge or briefly respond in a natural human way "
+            "based on the user's intent (greeting → greet back, emotion → empathize, "
+            "random question → acknowledge politely). Then gently redirect them to how "
+            "you can help with car-related topics. Keep the full reply within 12–15 words "
+            "and always sound natural, concise, and caring."
         )
+
     
     prompt = (
         f"{system_prompt}\n\n"
