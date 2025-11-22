@@ -13,9 +13,12 @@ from intent_service import (
     IntentExtractionError,
     IntentResult,
     ResponseGenerationError,
+    FlowRoutingError,
     extract_intent,
     generate_response,
     is_car_related,
+    is_car_related_llm,
+    route_to_flow,
 )
 from conversation_state import conversation_manager, detect_flow_switch, is_short_response
 from browse_car_flow import handle_browse_car_flow
@@ -184,7 +187,7 @@ async def handle_message(message: dict, metadata: dict):
     # Handle different message types
     if message_type == "text":
         text_body = message.get("text", {}).get("body", "")
-        print(f"Text: {text_body}")
+        print(f"📥 RECEIVED MESSAGE: {text_body}")
         # Add your message processing logic here
         await process_text_message(from_number, text_body, message_id)
     
@@ -314,7 +317,9 @@ async def handle_flow_switch_marker(
     from_number: str,
     text: str,
     intent_result: Any,
-    current_flow: Optional[str] = None
+    current_flow: Optional[str] = None,
+    depth: int = 0,
+    max_depth: int = 2
 ) -> Optional[str]:
     """Handle flow switch marker and route to target flow.
     
@@ -416,7 +421,6 @@ async def process_text_message(from_number: str, text: str, message_id: str):
                 # User wants to change criteria in current flow - let the flow handle it
                 # Don't extract intent, just route to current flow
                 if state.flow_name == "browse_car":
-                    from browse_car_flow import handle_browse_car_flow
                     response_text = await call_flow_handler_with_timeout(
                         handle_browse_car_flow, from_number, text, None
                     )
@@ -451,11 +455,9 @@ async def process_text_message(from_number: str, text: str, message_id: str):
                 # User said "No" - this is likely a response to a question
                 # Don't reset context, let the flow handle it
                 if state.flow_name == "browse_car":
-                    from browse_car_flow import handle_browse_car_flow
                     # Create a minimal intent result for "no"
                     class NoIntent:
                         intent = "negative_response"
-                        summary = "User responded with no"
                         confidence = 0.8
                         entities = {}
                     no_intent = NoIntent()
@@ -504,63 +506,133 @@ async def process_text_message(from_number: str, text: str, message_id: str):
                     await send_whatsapp_message(from_number, response_text)
                     return
         
-        # Step 1: Extract intent from the message FIRST to detect flow switches
-        intent_result: IntentResult = await extract_intent(text)
-        print("Intent extraction result:")
-        print(f"  Intent: {intent_result.intent}")
-        print(f"  Summary: {intent_result.summary}")
-        print(f"  Confidence: {intent_result.confidence:.2f}")
-        if intent_result.entities:
-            print(f"  Entities: {intent_result.entities}")
-        
-        # Step 2: Check current state and detect flow switches
+        # Step 1: Get current state BEFORE extracting intent (so we can pass flow context)
         state = conversation_manager.get_state(from_number)
         current_flow = state.flow_name if state else None
+        current_step = state.step if state else None
         
-        # Use detect_flow_switch() to avoid code duplication
-        target_flow = detect_flow_switch(intent_result, text, current_flow)
+        # Get conversation context for better intent understanding
+        conversation_context = conversation_manager.get_recent_context(from_number, max_exchanges=3)
         
-        # Also check for intent flags for Step 5 routing (when no active flow)
-        intent_lower = intent_result.intent.lower() if hasattr(intent_result, 'intent') and intent_result.intent else ""
-        text_lower = text.lower()
+        # Step 2: Check if we're awaiting intent confirmation
+        if state and state.data.get("awaiting_intent_confirmation", False):
+            # User is responding to an intent clarification question
+            original_message = state.data.get("pending_intent_message")
+            original_intent = state.data.get("pending_intent")
+            
+            print(f"🔵 [intent_confirmation] User responding to clarification. Original: '{original_message}', Original intent: {original_intent}")
+            
+            # Re-extract intent from user's confirmation/clarification
+            # User might be confirming, providing more context, or clarifying
+            intent_result: IntentResult = await extract_intent(
+                text,
+                conversation_context=f"Previous message: {original_message}\nUser intent was unclear. User is now clarifying or confirming.",
+                current_flow=current_flow,
+                current_step=current_step
+            )
+            
+            print(f"🔵 [intent_confirmation] Re-extracted intent: {intent_result.intent}, confidence: {intent_result.confidence:.2f}")
+            
+            # Clear confirmation flag
+            conversation_manager.update_data(
+                from_number,
+                awaiting_intent_confirmation=False,
+                pending_intent_message=None,
+                pending_intent=None
+            )
+            
+            # Continue with the new intent result for dynamic routing
+            print("Intent extraction result (after confirmation):")
+            print(f"  Intent: {intent_result.intent}")
+            print(f"  Confidence: {intent_result.confidence:.2f}")
+            if intent_result.entities:
+                print(f"  Entities: {intent_result.entities}")
+        else:
+            # Step 2: Extract intent from the message with flow context to avoid false flow switches
+            intent_result: IntentResult = await extract_intent(
+                text,
+                conversation_context=conversation_context if conversation_context else None,
+                current_flow=current_flow,
+                current_step=current_step
+            )
+            print("Intent extraction result:")
+            print(f"  Intent: {intent_result.intent}")
+            print(f"  Confidence: {intent_result.confidence:.2f}")
+            if intent_result.entities:
+                print(f"  Entities: {intent_result.entities}")
+            
+            # Check if LLM is confused (low confidence or unclear intent)
+            CONFIDENCE_THRESHOLD = 0.7
+            UNCLEAR_INTENTS = ["unknown", "unclear", "ambiguous", "unsure"]
+            
+            is_confused = (
+                intent_result.confidence < CONFIDENCE_THRESHOLD or
+                intent_result.intent.lower() in UNCLEAR_INTENTS or
+                (intent_result.intent.lower() == "unknown" and not intent_result.entities)
+            )
+            
+            if is_confused and not current_flow:
+                # LLM is confused and user is not in a flow - ask for clarification
+                print(f"⚠️ [intent_confirmation] LLM confused (confidence: {intent_result.confidence:.2f}, intent: {intent_result.intent})")
+                
+                # Store original message and intent for later
+                conversation_manager.update_data(
+                    from_number,
+                    awaiting_intent_confirmation=True,
+                    pending_intent_message=text,
+                    pending_intent=intent_result.intent
+                )
+                
+                # Generate a helpful clarification question directly
+                # Check if it's car-related to provide better context
+                try:
+                    is_car_related = await is_car_related_llm(text, intent_result)
+                    car_context = "I see you're asking about something car-related" if is_car_related else "I'm not entirely sure what you're looking for"
+                except Exception as e:
+                    print(f"Error checking car-related: {e}")
+                    car_context = "I want to make sure I understand correctly"
+                
+                clarification_message = (
+                    f"🤔 {car_context}.\n\n"
+                    f"Could you please clarify what you'd like to do?\n\n"
+                    f"For example:\n"
+                    f"• Browse used cars\n"
+                    f"• Get car valuation\n"
+                    f"• Calculate EMI\n"
+                    f"• Book a service\n\n"
+                    f"Just let me know what you need! 😊"
+                )
+                
+                await send_whatsapp_message(from_number, clarification_message, user_message=text)
+                print(f"Sent intent clarification request to {from_number}")
+                return
         
-        service_keywords = ["book service", "service booking", "book a service", "service", "servicing", "repair", "maintenance", "book"]
-        is_service_intent = (
-            "service" in intent_lower or
-            "booking" in intent_lower or
-            "book" in intent_lower or
-            "repair" in intent_lower or
-            "servicing" in intent_lower or
-            any(keyword in text_lower for keyword in service_keywords)
-        )
+        # Step 3: Use LLM-based router to determine flow routing
+        routing_result = None
+        target_flow = None
+        try:
+            routing_result = await route_to_flow(
+                text,
+                conversation_context=conversation_context if conversation_context else None,
+                current_flow=current_flow,
+                current_step=current_step,
+                intent_result=intent_result
+            )
+            print("Flow routing result:")
+            print(f"  Target flow: {routing_result.target_flow}")
+            print(f"  Confidence: {routing_result.confidence:.2f}")
+            print(f"  Should switch: {routing_result.should_switch}")
+            print(f"  Reasoning: {routing_result.reasoning}")
+            
+            target_flow = routing_result.target_flow if routing_result.should_switch else None
+            
+        except FlowRoutingError as routing_exc:
+            print(f"Flow routing failed: {routing_exc}, falling back to keyword-based detection")
+            # Fallback to keyword-based detection if LLM routing fails
+            target_flow = detect_flow_switch(intent_result, text, current_flow)
+            routing_result = None  # Set to None to indicate fallback was used
         
-        emi_keywords = ["emi", "loan", "installment", "finance", "down payment", "monthly payment", "monthly emi", "calculate emi"]
-        is_emi_intent = (
-            "emi" in intent_lower or
-            "loan" in intent_lower or
-            "installment" in intent_lower or
-            "finance" in intent_lower or
-            any(keyword in text_lower for keyword in emi_keywords)
-        )
-        
-        valuation_keywords = ["value", "valuation", "price", "worth", "resale", "sell", "how much", "estimate", "appraise"]
-        is_valuation_intent = (
-            "value" in intent_lower or
-            "valuation" in intent_lower or
-            "price" in intent_lower or
-            "worth" in intent_lower or
-            any(keyword in text_lower for keyword in valuation_keywords)
-        )
-        
-        browse_keywords = ["browse", "buy", "purchase", "looking for", "want to buy", "search", "find car"]
-        is_browse_intent = (
-            "browse" in intent_lower or
-            "buy" in intent_lower or
-            "purchase" in intent_lower or
-            any(keyword in text_lower for keyword in browse_keywords)
-        )
-        
-        # Step 3: Handle flow switching or continue current flow
+        # Step 4: Handle flow switching or continue current flow
         # If user wants to switch to a different flow, clear current state and route to new flow
         if target_flow and target_flow != current_flow:
             print(f"Flow switch detected: {current_flow} -> {target_flow}")
@@ -654,7 +726,7 @@ async def process_text_message(from_number: str, text: str, message_id: str):
                 except Exception as flow_exc:
                     print(f"Error switching to browse car flow: {flow_exc}")
         
-        # Step 4: Route to appropriate flow based on current state (no switch detected)
+        # Step 5: Route to appropriate flow based on current state (no switch detected)
         # Get state again in case it was updated
         state = conversation_manager.get_state(from_number)
         
@@ -761,67 +833,72 @@ async def process_text_message(from_number: str, text: str, message_id: str):
                 print(f"Error in service booking flow: {flow_exc}")
                 # Fall through to normal processing
         
-        # Step 5: If no active flow, route to detected flow or general response
-        if is_service_intent:
-            # Route to service booking flow
-            try:
-                from service_booking_flow import handle_service_booking_flow
-                response_text = await call_flow_handler_with_timeout(
-                    handle_service_booking_flow, from_number, text, intent_result
-                )
-                await send_whatsapp_message(from_number, response_text, user_message=text)
-                print(f"Service booking flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating service booking flow: {flow_exc}")
-                # Fall through to normal processing
+        # Step 6: If no active flow, route to detected flow using LLM router
+        # Check if routing result suggests a flow (when not in active flow)
+        if not current_flow and routing_result and routing_result.target_flow:
+            target_flow = routing_result.target_flow
+            
+            if target_flow == "service_booking":
+                try:
+                    from service_booking_flow import handle_service_booking_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_service_booking_flow, from_number, text, intent_result
+                    )
+                    await send_whatsapp_message(from_number, response_text, user_message=text)
+                    print(f"Service booking flow initiated for {from_number}")
+                    return
+                except Exception as flow_exc:
+                    print(f"Error initiating service booking flow: {flow_exc}")
+                    # Fall through to normal processing
+            
+            elif target_flow == "emi":
+                try:
+                    from emi_flow import handle_emi_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_emi_flow, from_number, text, intent_result
+                    )
+                    await send_whatsapp_message(from_number, response_text, user_message=text)
+                    print(f"EMI flow initiated for {from_number}")
+                    return
+                except Exception as flow_exc:
+                    print(f"Error initiating EMI flow: {flow_exc}")
+                    # Fall through to normal processing
+            
+            elif target_flow == "car_valuation":
+                try:
+                    from car_valuation_flow import handle_car_valuation_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_car_valuation_flow, from_number, text, intent_result
+                    )
+                    await send_whatsapp_message(from_number, response_text, user_message=text)
+                    print(f"Car valuation flow initiated for {from_number}")
+                    return
+                except Exception as flow_exc:
+                    print(f"Error initiating car valuation flow: {flow_exc}")
+                    # Fall through to normal processing
+            
+            elif target_flow == "browse_car":
+                try:
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_browse_car_flow, from_number, text, intent_result
+                    )
+                    await send_whatsapp_message(from_number, response_text, user_message=text)
+                    print(f"Browse car flow initiated for {from_number}")
+                    return
+                except Exception as flow_exc:
+                    print(f"Error initiating browse car flow: {flow_exc}")
+                    # Fall through to normal processing
         
-        if is_emi_intent:
-            # Route to EMI flow
-            try:
-                from emi_flow import handle_emi_flow
-                response_text = await call_flow_handler_with_timeout(
-                    handle_emi_flow, from_number, text, intent_result
-                )
-                await send_whatsapp_message(from_number, response_text, user_message=text)
-                print(f"EMI flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating EMI flow: {flow_exc}")
-                # Fall through to normal processing
+        # Step 7: Determine if the query is car-related using LLM for better accuracy
+        try:
+            car_related = await is_car_related_llm(text, intent_result)
+            print(f"  Car-related: {car_related}")
+        except Exception as car_check_exc:
+            print(f"LLM car-related check failed: {car_check_exc}, using keyword-based fallback")
+            car_related = is_car_related(intent_result, text)
+            print(f"  Car-related (fallback): {car_related}")
         
-        if is_valuation_intent:
-            # Route to car valuation flow
-            try:
-                from car_valuation_flow import handle_car_valuation_flow
-                response_text = await call_flow_handler_with_timeout(
-                    handle_car_valuation_flow, from_number, text, intent_result
-                )
-                await send_whatsapp_message(from_number, response_text, user_message=text)
-                print(f"Car valuation flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating car valuation flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        if is_browse_intent:
-            # Route to browse car flow
-            try:
-                response_text = await call_flow_handler_with_timeout(
-                    handle_browse_car_flow, from_number, text, intent_result
-                )
-                await send_whatsapp_message(from_number, response_text, user_message=text)
-                print(f"Browse car flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating browse car flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 6: Determine if the query is car-related
-        car_related = is_car_related(intent_result, text)
-        print(f"  Car-related: {car_related}")
-        
-        # Step 7: Generate human-like response based on intent
+        # Step 8: Generate human-like response based on intent
         try:
             response_text = await generate_response(
                 original_message=text,
@@ -830,7 +907,7 @@ async def process_text_message(from_number: str, text: str, message_id: str):
             )
             print(f"Generated response: {response_text}")
             
-            # Step 8: Send the response back to the user
+            # Step 9: Send the response back to the user
             await send_whatsapp_message(from_number, response_text, user_message=text)
             print(f"Response sent to {from_number}")
             
@@ -915,6 +992,7 @@ async def send_whatsapp_message(
     
     # Validate and sanitize message before sending
     validated_message = validate_and_sanitize_response(message)
+    print(f"📤 SENDING MESSAGE TO {to}: {validated_message[:200]}{'...' if len(validated_message) > 200 else ''}")
     
     phone_number_id = phone_number_id or os.getenv("PHONE_NUMBER_ID")
     access_token = access_token or os.getenv("ACCESS_TOKEN")

@@ -198,12 +198,73 @@ class CarDatabase:
         random_suffix = random.randint(1000, 9999)
         confirmation_id = f"TD{timestamp}{random_suffix}"
         
+        # Parse preferred_date to a proper date/timestamp
+        # If preferred_date is provided, try to parse it; otherwise use current date/time
+        booking_date = datetime.now()  # Default to current date/time
+        
+        if preferred_date:
+            try:
+                # Try to parse common date formats
+                # Handle formats like "23 rd", "23 rd nov", "today", "tomorrow", etc.
+                import re
+                from datetime import timedelta
+                
+                preferred_lower = preferred_date.lower().strip()
+                
+                # Handle relative dates
+                if "today" in preferred_lower:
+                    booking_date = datetime.now()
+                elif "tomorrow" in preferred_lower:
+                    booking_date = datetime.now() + timedelta(days=1)
+                else:
+                    # Try to extract day number (e.g., "23 rd" -> 23)
+                    day_match = re.search(r'(\d{1,2})', preferred_date)
+                    if day_match:
+                        day = int(day_match.group(1))
+                        # Use current month/year, or try to parse month name
+                        current_date = datetime.now()
+                        month = current_date.month
+                        year = current_date.year
+                        
+                        # Try to find month name
+                        months = {
+                            'jan': 1, 'january': 1, 'feb': 2, 'february': 2,
+                            'mar': 3, 'march': 3, 'apr': 4, 'april': 4,
+                            'may': 5, 'jun': 6, 'june': 6, 'jul': 7, 'july': 7,
+                            'aug': 8, 'august': 8, 'sep': 9, 'september': 9,
+                            'oct': 10, 'october': 10, 'nov': 11, 'november': 11,
+                            'dec': 12, 'december': 12
+                        }
+                        
+                        for month_name, month_num in months.items():
+                            if month_name in preferred_lower:
+                                month = month_num
+                                break
+                        
+                        try:
+                            booking_date = datetime(year, month, day)
+                            # If the date is in the past, assume next month or next year
+                            if booking_date < datetime.now():
+                                if month == 12:
+                                    booking_date = datetime(year + 1, 1, day)
+                                else:
+                                    booking_date = datetime(year, month + 1, day)
+                        except ValueError:
+                            # Invalid date (e.g., Feb 30), use current date/time
+                            booking_date = datetime.now()
+                    else:
+                        # Couldn't parse, use current date/time
+                        booking_date = datetime.now()
+            except Exception as e:
+                print(f"Warning: Could not parse preferred_date '{preferred_date}': {e}. Using current date/time.")
+                booking_date = datetime.now()
+        
         async with self._pool.acquire() as conn:
             booking_id = await conn.fetchval(
                 """
                 INSERT INTO test_drive_bookings 
-                (confirmation_id, customer_name, customer_phone, vehicle_id, car_name, location, status, notes, created_at, updated_at)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, NOW(), NOW())
+                (confirmation_id, customer_name, customer_phone, vehicle_id, car_name, location, status, notes, booking_date, created_at, updated_at)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW(), NOW())
                 RETURNING id
                 """,
                 confirmation_id,
@@ -213,7 +274,8 @@ class CarDatabase:
                 car_name,  # car_name
                 location_type,  # location
                 'pending',  # status
-                f"Has DL: {has_dl}" if has_dl else "No DL provided"  # notes (store has_dl info here)
+                f"Has DL: {has_dl}" if has_dl else "No DL provided",  # notes (store has_dl info here)
+                booking_date  # booking_date (timestamp)
             )
             return booking_id
     

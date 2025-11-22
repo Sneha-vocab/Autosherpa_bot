@@ -236,12 +236,17 @@ def detect_flow_switch(intent_result: Any, message: str, current_flow: Optional[
         any(keyword in text_lower for keyword in valuation_keywords)
     )
     
-    browse_keywords = ["browse", "buy", "purchase", "looking for", "want to buy", "search", "find car", "used car", "used cars"]
+    browse_keywords = ["browse", "buy", "purchase", "looking for", "want to buy", "want a", "want", "search", "find car", "used car", "used cars", "show me", "i want"]
     is_browse_intent = (
         "browse" in intent_lower or
         ("buy" in intent_lower and "car" in text_lower) or
         ("purchase" in intent_lower and "car" in text_lower) or
-        any(keyword in text_lower for keyword in browse_keywords)
+        any(keyword in text_lower for keyword in browse_keywords) or
+        # Also check if user mentioned a car type (sedan, suv, etc.) with "want" or "looking for"
+        (("want" in text_lower or "looking" in text_lower) and 
+         any(car_type in text_lower for car_type in ["sedan", "suv", "hatchback", "coupe", "convertible", "car", "vehicle"])) or
+        # Check if intent has car-related entities
+        (intent_result.entities and any(key in intent_result.entities for key in ["car_type", "vehicle_type", "product"]))
     )
     
     # Determine target flow
