@@ -5,8 +5,9 @@ from pydantic import BaseModel
 import hmac
 import hashlib
 import os
-from typing import Optional
+from typing import Optional, Any
 import uvicorn
+import asyncio
 from dotenv import load_dotenv
 from intent_service import (
     IntentExtractionError,
@@ -16,7 +17,7 @@ from intent_service import (
     generate_response,
     is_car_related,
 )
-from conversation_state import conversation_manager
+from conversation_state import conversation_manager, detect_flow_switch, is_short_response
 from browse_car_flow import handle_browse_car_flow
 from database import car_db
 
@@ -236,6 +237,146 @@ async def handle_message(message: dict, metadata: dict):
     print("=" * 30 + "\n")
 
 
+# Valid flow names
+VALID_FLOWS = ["browse_car", "emi", "car_valuation", "service_booking"]
+
+# Timeout for flow handlers (in seconds)
+FLOW_HANDLER_TIMEOUT = 30.0  # 30 seconds timeout for flow handlers
+
+
+def validate_and_sanitize_response(response_text: Optional[str]) -> str:
+    """Validate and sanitize response text before sending.
+    
+    Args:
+        response_text: The response text to validate (may be None or empty)
+    
+    Returns:
+        A valid, non-empty response string. Returns a fallback message if input is invalid.
+    """
+    if not response_text:
+        return (
+            "I encountered an issue processing your request. "
+            "Please try again with a clear message."
+        )
+    
+    # Strip whitespace and check if empty
+    sanitized = response_text.strip()
+    if not sanitized:
+        return (
+            "I encountered an issue processing your request. "
+            "Please try again with a clear message."
+        )
+    
+    # Ensure message is not too long (WhatsApp limit is 4096 characters)
+    if len(sanitized) > 4096:
+        print(f"Warning: Response text too long ({len(sanitized)} chars), truncating to 4096")
+        sanitized = sanitized[:4093] + "..."
+    
+    return sanitized
+
+
+async def call_flow_handler_with_timeout(
+    handler_func,
+    *args,
+    timeout: float = FLOW_HANDLER_TIMEOUT,
+    **kwargs
+) -> str:
+    """Call a flow handler with timeout protection.
+    
+    Args:
+        handler_func: The flow handler function to call
+        *args: Positional arguments for the handler
+        timeout: Timeout in seconds (default: FLOW_HANDLER_TIMEOUT)
+        **kwargs: Keyword arguments for the handler
+    
+    Returns:
+        Response text from the handler, or timeout error message
+    """
+    try:
+        response = await asyncio.wait_for(
+            handler_func(*args, **kwargs),
+            timeout=timeout
+        )
+        return response
+    except asyncio.TimeoutError:
+        print(f"Flow handler timed out after {timeout} seconds")
+        return (
+            "I'm taking longer than expected to process your request. "
+            "Please try again in a moment, or contact us directly if the issue persists."
+        )
+    except Exception as e:
+        print(f"Error in flow handler: {e}")
+        raise
+
+
+async def handle_flow_switch_marker(
+    response_text: str,
+    from_number: str,
+    text: str,
+    intent_result: Any,
+    current_flow: Optional[str] = None
+) -> Optional[str]:
+    """Handle flow switch marker and route to target flow.
+    
+    Args:
+        response_text: The response text that may contain a flow switch marker
+        from_number: User's phone number
+        text: Original message text
+        intent_result: Intent extraction result
+        current_flow: Current flow name to prevent self-switching
+    
+    Returns:
+        Updated response text, or None if no switch marker found
+    """
+    if not response_text or not response_text.startswith("__FLOW_SWITCH__:"):
+        return None
+    
+    try:
+        parts = response_text.split(":")
+        if len(parts) < 2:
+            print(f"Warning: Malformed flow switch marker: {response_text}")
+            return "I'm having trouble switching flows. Please try again with a clear request."
+        
+        target_flow = parts[1].strip()
+        
+        # Validate target flow
+        if target_flow not in VALID_FLOWS:
+            print(f"Warning: Invalid flow switch target: {target_flow}")
+            return "I'm having trouble switching flows. Please try again with a clear request."
+        
+        # Prevent self-switching
+        if target_flow == current_flow:
+            print(f"Warning: Self-referential flow switch detected: {target_flow}")
+            return "I'm having trouble switching flows. Please try again with a clear request."
+        
+        # Route to target flow with timeout protection
+        if target_flow == "browse_car":
+            return await call_flow_handler_with_timeout(
+                handle_browse_car_flow, from_number, text, intent_result
+            )
+        elif target_flow == "emi":
+            from emi_flow import handle_emi_flow
+            return await call_flow_handler_with_timeout(
+                handle_emi_flow, from_number, text, intent_result
+            )
+        elif target_flow == "car_valuation":
+            from car_valuation_flow import handle_car_valuation_flow
+            return await call_flow_handler_with_timeout(
+                handle_car_valuation_flow, from_number, text, intent_result
+            )
+        elif target_flow == "service_booking":
+            from service_booking_flow import handle_service_booking_flow
+            return await call_flow_handler_with_timeout(
+                handle_service_booking_flow, from_number, text, intent_result
+            )
+        
+    except Exception as e:
+        print(f"Error handling flow switch marker: {e}")
+        return "I'm having trouble switching flows. Please try again with a clear request."
+    
+    return None
+
+
 async def handle_status_update(status: dict):
     """
     Process message status updates (sent, delivered, read, failed)
@@ -264,58 +405,106 @@ async def process_text_message(from_number: str, text: str, message_id: str):
     Process incoming text messages with intent extraction and response generation.
     Handles both car-related queries and out-of-context questions gracefully.
     Routes to specific flows (like browse_car) when appropriate.
+    Supports flow switching during conversations.
     """
     try:
-        # Check if user is in an active conversation flow
+        # Check for "change" keyword first - if user is in a flow, handle it in that flow
         state = conversation_manager.get_state(from_number)
-        if state and state.flow_name == "browse_car":
-            # User is in browse car flow, handle it directly
-            try:
-                response_text = await handle_browse_car_flow(from_number, text, None)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Browse car flow response sent to {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error in browse car flow: {flow_exc}")
-                # Fall through to normal processing
+        if state and state.flow_name:
+            message_lower = text.lower().strip()
+            if message_lower == "change" or message_lower == "modify":
+                # User wants to change criteria in current flow - let the flow handle it
+                # Don't extract intent, just route to current flow
+                if state.flow_name == "browse_car":
+                    from browse_car_flow import handle_browse_car_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_browse_car_flow, from_number, text, None
+                    )
+                    await send_whatsapp_message(from_number, response_text)
+                    return
+                elif state.flow_name == "car_valuation":
+                    from car_valuation_flow import handle_car_valuation_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_car_valuation_flow, from_number, text, None
+                    )
+                    await send_whatsapp_message(from_number, response_text)
+                    return
+                elif state.flow_name == "emi":
+                    from emi_flow import handle_emi_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_emi_flow, from_number, text, None
+                    )
+                    await send_whatsapp_message(from_number, response_text)
+                    return
+                elif state.flow_name == "service_booking":
+                    from service_booking_flow import handle_service_booking_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_service_booking_flow, from_number, text, None
+                    )
+                    await send_whatsapp_message(from_number, response_text)
+                    return
         
-        if state and state.flow_name == "car_valuation":
-            # User is in car valuation flow, handle it directly
-            try:
-                from car_valuation_flow import handle_car_valuation_flow
-                response_text = await handle_car_valuation_flow(from_number, text, None)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Car valuation flow response sent to {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error in car valuation flow: {flow_exc}")
-                # Fall through to normal processing
+        # Check for "No" - if user is in a flow, handle it contextually
+        if state and state.flow_name:
+            message_lower = text.lower().strip()
+            if message_lower == "no" or message_lower == "nope":
+                # User said "No" - this is likely a response to a question
+                # Don't reset context, let the flow handle it
+                if state.flow_name == "browse_car":
+                    from browse_car_flow import handle_browse_car_flow
+                    # Create a minimal intent result for "no"
+                    class NoIntent:
+                        intent = "negative_response"
+                        summary = "User responded with no"
+                        confidence = 0.8
+                        entities = {}
+                    no_intent = NoIntent()
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_browse_car_flow, from_number, text, no_intent
+                    )
+                    await send_whatsapp_message(from_number, response_text)
+                    return
+                elif state.flow_name == "car_valuation":
+                    from car_valuation_flow import handle_car_valuation_flow
+                    class NoIntent:
+                        intent = "negative_response"
+                        summary = "User responded with no"
+                        confidence = 0.8
+                        entities = {}
+                    no_intent = NoIntent()
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_car_valuation_flow, from_number, text, no_intent
+                    )
+                    await send_whatsapp_message(from_number, response_text)
+                    return
+                elif state.flow_name == "emi":
+                    from emi_flow import handle_emi_flow
+                    class NoIntent:
+                        intent = "negative_response"
+                        summary = "User responded with no"
+                        confidence = 0.8
+                        entities = {}
+                    no_intent = NoIntent()
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_emi_flow, from_number, text, no_intent
+                    )
+                    await send_whatsapp_message(from_number, response_text)
+                    return
+                elif state.flow_name == "service_booking":
+                    from service_booking_flow import handle_service_booking_flow
+                    class NoIntent:
+                        intent = "negative_response"
+                        summary = "User responded with no"
+                        confidence = 0.8
+                        entities = {}
+                    no_intent = NoIntent()
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_service_booking_flow, from_number, text, no_intent
+                    )
+                    await send_whatsapp_message(from_number, response_text)
+                    return
         
-        if state and state.flow_name == "emi":
-            # User is in EMI flow, handle it directly
-            try:
-                from emi_flow import handle_emi_flow
-                response_text = await handle_emi_flow(from_number, text, None)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"EMI flow response sent to {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error in EMI flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        if state and state.flow_name == "service_booking":
-            # User is in service booking flow, handle it directly
-            try:
-                from service_booking_flow import handle_service_booking_flow
-                response_text = await handle_service_booking_flow(from_number, text, None)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Service booking flow response sent to {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error in service booking flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 1: Extract intent from the message
+        # Step 1: Extract intent from the message FIRST to detect flow switches
         intent_result: IntentResult = await extract_intent(text)
         print("Intent extraction result:")
         print(f"  Intent: {intent_result.intent}")
@@ -324,8 +513,15 @@ async def process_text_message(from_number: str, text: str, message_id: str):
         if intent_result.entities:
             print(f"  Entities: {intent_result.entities}")
         
-        # Step 2: Check for service booking intent
-        intent_lower = intent_result.intent.lower()
+        # Step 2: Check current state and detect flow switches
+        state = conversation_manager.get_state(from_number)
+        current_flow = state.flow_name if state else None
+        
+        # Use detect_flow_switch() to avoid code duplication
+        target_flow = detect_flow_switch(intent_result, text, current_flow)
+        
+        # Also check for intent flags for Step 5 routing (when no active flow)
+        intent_lower = intent_result.intent.lower() if hasattr(intent_result, 'intent') and intent_result.intent else ""
         text_lower = text.lower()
         
         service_keywords = ["book service", "service booking", "book a service", "service", "servicing", "repair", "maintenance", "book"]
@@ -338,19 +534,6 @@ async def process_text_message(from_number: str, text: str, message_id: str):
             any(keyword in text_lower for keyword in service_keywords)
         )
         
-        if is_service_intent:
-            # Route to service booking flow
-            try:
-                from service_booking_flow import handle_service_booking_flow
-                response_text = await handle_service_booking_flow(from_number, text, intent_result)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Service booking flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating service booking flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 3: Check for EMI intent
         emi_keywords = ["emi", "loan", "installment", "finance", "down payment", "monthly payment", "monthly emi", "calculate emi"]
         is_emi_intent = (
             "emi" in intent_lower or
@@ -360,19 +543,6 @@ async def process_text_message(from_number: str, text: str, message_id: str):
             any(keyword in text_lower for keyword in emi_keywords)
         )
         
-        if is_emi_intent:
-            # Route to EMI flow
-            try:
-                from emi_flow import handle_emi_flow
-                response_text = await handle_emi_flow(from_number, text, intent_result)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"EMI flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating EMI flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 4: Check for car_valuation intent
         valuation_keywords = ["value", "valuation", "price", "worth", "resale", "sell", "how much", "estimate", "appraise"]
         is_valuation_intent = (
             "value" in intent_lower or
@@ -382,19 +552,6 @@ async def process_text_message(from_number: str, text: str, message_id: str):
             any(keyword in text_lower for keyword in valuation_keywords)
         )
         
-        if is_valuation_intent:
-            # Route to car valuation flow
-            try:
-                from car_valuation_flow import handle_car_valuation_flow
-                response_text = await handle_car_valuation_flow(from_number, text, intent_result)
-                await send_whatsapp_message(from_number, response_text)
-                print(f"Car valuation flow initiated for {from_number}")
-                return
-            except Exception as flow_exc:
-                print(f"Error initiating car valuation flow: {flow_exc}")
-                # Fall through to normal processing
-        
-        # Step 5: Check for browse_car intent
         browse_keywords = ["browse", "buy", "purchase", "looking for", "want to buy", "search", "find car"]
         is_browse_intent = (
             "browse" in intent_lower or
@@ -403,11 +560,257 @@ async def process_text_message(from_number: str, text: str, message_id: str):
             any(keyword in text_lower for keyword in browse_keywords)
         )
         
+        # Step 3: Handle flow switching or continue current flow
+        # If user wants to switch to a different flow, clear current state and route to new flow
+        if target_flow and target_flow != current_flow:
+            print(f"Flow switch detected: {current_flow} -> {target_flow}")
+            conversation_manager.clear_state(from_number)
+            
+            # Route to the new flow immediately
+            if target_flow == "service_booking":
+                try:
+                    from service_booking_flow import handle_service_booking_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_service_booking_flow, from_number, text, intent_result
+                    )
+                    # Check if the new flow also requested a switch (shouldn't happen, but safety check)
+                    switch_response = await handle_flow_switch_marker(
+                        response_text, from_number, text, intent_result, "service_booking"
+                    )
+                    if switch_response is not None:
+                        response_text = switch_response
+                        # Prevent further nesting
+                        if response_text and response_text.startswith("__FLOW_SWITCH__:"):
+                            print(f"Warning: Nested flow switch detected, sending fallback message")
+                            response_text = "I'm having trouble switching flows. Please try again with a clear request."
+                    await send_whatsapp_message(from_number, response_text, user_message=text)
+                    print(f"Switched to service booking flow for {from_number}")
+                    return
+                except Exception as flow_exc:
+                    print(f"Error switching to service booking flow: {flow_exc}")
+            
+            elif target_flow == "emi":
+                try:
+                    from emi_flow import handle_emi_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_emi_flow, from_number, text, intent_result
+                    )
+                    # Check if the new flow also requested a switch (shouldn't happen, but safety check)
+                    switch_response = await handle_flow_switch_marker(
+                        response_text, from_number, text, intent_result, "emi"
+                    )
+                    if switch_response is not None:
+                        response_text = switch_response
+                        # Prevent further nesting
+                        if response_text and response_text.startswith("__FLOW_SWITCH__:"):
+                            print(f"Warning: Nested flow switch detected, sending fallback message")
+                            response_text = "I'm having trouble switching flows. Please try again with a clear request."
+                    await send_whatsapp_message(from_number, response_text, user_message=text)
+                    print(f"Switched to EMI flow for {from_number}")
+                    return
+                except Exception as flow_exc:
+                    print(f"Error switching to EMI flow: {flow_exc}")
+            
+            elif target_flow == "car_valuation":
+                try:
+                    from car_valuation_flow import handle_car_valuation_flow
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_car_valuation_flow, from_number, text, intent_result
+                    )
+                    # Check if the new flow also requested a switch (shouldn't happen, but safety check)
+                    switch_response = await handle_flow_switch_marker(
+                        response_text, from_number, text, intent_result, "car_valuation"
+                    )
+                    if switch_response is not None:
+                        response_text = switch_response
+                        # Prevent further nesting
+                        if response_text and response_text.startswith("__FLOW_SWITCH__:"):
+                            print(f"Warning: Nested flow switch detected, sending fallback message")
+                            response_text = "I'm having trouble switching flows. Please try again with a clear request."
+                    await send_whatsapp_message(from_number, response_text, user_message=text)
+                    print(f"Switched to car valuation flow for {from_number}")
+                    return
+                except Exception as flow_exc:
+                    print(f"Error switching to car valuation flow: {flow_exc}")
+            
+            elif target_flow == "browse_car":
+                try:
+                    response_text = await call_flow_handler_with_timeout(
+                        handle_browse_car_flow, from_number, text, intent_result
+                    )
+                    # Check if the new flow also requested a switch (shouldn't happen, but safety check)
+                    switch_response = await handle_flow_switch_marker(
+                        response_text, from_number, text, intent_result, "browse_car"
+                    )
+                    if switch_response is not None:
+                        response_text = switch_response
+                        # Prevent further nesting
+                        if response_text and response_text.startswith("__FLOW_SWITCH__:"):
+                            print(f"Warning: Nested flow switch detected, sending fallback message")
+                            response_text = "I'm having trouble switching flows. Please try again with a clear request."
+                    await send_whatsapp_message(from_number, response_text, user_message=text)
+                    print(f"Switched to browse car flow for {from_number}")
+                    return
+                except Exception as flow_exc:
+                    print(f"Error switching to browse car flow: {flow_exc}")
+        
+        # Step 4: Route to appropriate flow based on current state (no switch detected)
+        # Get state again in case it was updated
+        state = conversation_manager.get_state(from_number)
+        
+        if state and state.flow_name == "browse_car":
+            # User is in browse car flow, handle it directly
+            try:
+                response_text = await call_flow_handler_with_timeout(
+                    handle_browse_car_flow, from_number, text, intent_result
+                )
+                
+                # Check if flow requested a switch
+                switch_response = await handle_flow_switch_marker(
+                    response_text, from_number, text, intent_result, "browse_car"
+                )
+                if switch_response is not None:
+                    response_text = switch_response
+                    # Check if the new flow also requested a switch (prevent infinite loops)
+                    if response_text and response_text.startswith("__FLOW_SWITCH__:"):
+                        print(f"Warning: Nested flow switch detected, sending fallback message")
+                        response_text = "I'm having trouble switching flows. Please try again with a clear request."
+                
+                await send_whatsapp_message(from_number, response_text, user_message=text)
+                print(f"Browse car flow response sent to {from_number}")
+                return
+            except Exception as flow_exc:
+                print(f"Error in browse car flow: {flow_exc}")
+                # Fall through to normal processing
+        
+        elif state and state.flow_name == "car_valuation":
+            # User is in car valuation flow, handle it directly
+            try:
+                from car_valuation_flow import handle_car_valuation_flow
+                response_text = await call_flow_handler_with_timeout(
+                    handle_car_valuation_flow, from_number, text, intent_result
+                )
+                
+                # Check if flow requested a switch
+                switch_response = await handle_flow_switch_marker(
+                    response_text, from_number, text, intent_result, "car_valuation"
+                )
+                if switch_response is not None:
+                    response_text = switch_response
+                    # Check if the new flow also requested a switch (prevent infinite loops)
+                    if response_text and response_text.startswith("__FLOW_SWITCH__:"):
+                        print(f"Warning: Nested flow switch detected, sending fallback message")
+                        response_text = "I'm having trouble switching flows. Please try again with a clear request."
+                
+                await send_whatsapp_message(from_number, response_text, user_message=text)
+                print(f"Car valuation flow response sent to {from_number}")
+                return
+            except Exception as flow_exc:
+                print(f"Error in car valuation flow: {flow_exc}")
+                # Fall through to normal processing
+        
+        elif state and state.flow_name == "emi":
+            # User is in EMI flow, handle it directly
+            try:
+                from emi_flow import handle_emi_flow
+                response_text = await call_flow_handler_with_timeout(
+                    handle_emi_flow, from_number, text, intent_result
+                )
+                
+                # Check if flow requested a switch
+                switch_response = await handle_flow_switch_marker(
+                    response_text, from_number, text, intent_result, "emi"
+                )
+                if switch_response is not None:
+                    response_text = switch_response
+                    # Check if the new flow also requested a switch (prevent infinite loops)
+                    if response_text and response_text.startswith("__FLOW_SWITCH__:"):
+                        print(f"Warning: Nested flow switch detected, sending fallback message")
+                        response_text = "I'm having trouble switching flows. Please try again with a clear request."
+                
+                await send_whatsapp_message(from_number, response_text, user_message=text)
+                print(f"EMI flow response sent to {from_number}")
+                return
+            except Exception as flow_exc:
+                print(f"Error in EMI flow: {flow_exc}")
+                # Fall through to normal processing
+        
+        elif state and state.flow_name == "service_booking":
+            # User is in service booking flow, handle it directly
+            try:
+                from service_booking_flow import handle_service_booking_flow
+                response_text = await call_flow_handler_with_timeout(
+                    handle_service_booking_flow, from_number, text, intent_result
+                )
+                
+                # Check if flow requested a switch
+                switch_response = await handle_flow_switch_marker(
+                    response_text, from_number, text, intent_result, "service_booking"
+                )
+                if switch_response is not None:
+                    response_text = switch_response
+                    # Check if the new flow also requested a switch (prevent infinite loops)
+                    if response_text and response_text.startswith("__FLOW_SWITCH__:"):
+                        print(f"Warning: Nested flow switch detected, sending fallback message")
+                        response_text = "I'm having trouble switching flows. Please try again with a clear request."
+                
+                await send_whatsapp_message(from_number, response_text, user_message=text)
+                print(f"Service booking flow response sent to {from_number}")
+                return
+            except Exception as flow_exc:
+                print(f"Error in service booking flow: {flow_exc}")
+                # Fall through to normal processing
+        
+        # Step 5: If no active flow, route to detected flow or general response
+        if is_service_intent:
+            # Route to service booking flow
+            try:
+                from service_booking_flow import handle_service_booking_flow
+                response_text = await call_flow_handler_with_timeout(
+                    handle_service_booking_flow, from_number, text, intent_result
+                )
+                await send_whatsapp_message(from_number, response_text, user_message=text)
+                print(f"Service booking flow initiated for {from_number}")
+                return
+            except Exception as flow_exc:
+                print(f"Error initiating service booking flow: {flow_exc}")
+                # Fall through to normal processing
+        
+        if is_emi_intent:
+            # Route to EMI flow
+            try:
+                from emi_flow import handle_emi_flow
+                response_text = await call_flow_handler_with_timeout(
+                    handle_emi_flow, from_number, text, intent_result
+                )
+                await send_whatsapp_message(from_number, response_text, user_message=text)
+                print(f"EMI flow initiated for {from_number}")
+                return
+            except Exception as flow_exc:
+                print(f"Error initiating EMI flow: {flow_exc}")
+                # Fall through to normal processing
+        
+        if is_valuation_intent:
+            # Route to car valuation flow
+            try:
+                from car_valuation_flow import handle_car_valuation_flow
+                response_text = await call_flow_handler_with_timeout(
+                    handle_car_valuation_flow, from_number, text, intent_result
+                )
+                await send_whatsapp_message(from_number, response_text, user_message=text)
+                print(f"Car valuation flow initiated for {from_number}")
+                return
+            except Exception as flow_exc:
+                print(f"Error initiating car valuation flow: {flow_exc}")
+                # Fall through to normal processing
+        
         if is_browse_intent:
             # Route to browse car flow
             try:
-                response_text = await handle_browse_car_flow(from_number, text, intent_result)
-                await send_whatsapp_message(from_number, response_text)
+                response_text = await call_flow_handler_with_timeout(
+                    handle_browse_car_flow, from_number, text, intent_result
+                )
+                await send_whatsapp_message(from_number, response_text, user_message=text)
                 print(f"Browse car flow initiated for {from_number}")
                 return
             except Exception as flow_exc:
@@ -428,7 +831,7 @@ async def process_text_message(from_number: str, text: str, message_id: str):
             print(f"Generated response: {response_text}")
             
             # Step 8: Send the response back to the user
-            await send_whatsapp_message(from_number, response_text)
+            await send_whatsapp_message(from_number, response_text, user_message=text)
             print(f"Response sent to {from_number}")
             
         except ResponseGenerationError as exc:
@@ -445,7 +848,7 @@ async def process_text_message(from_number: str, text: str, message_id: str):
                     "I'm having trouble processing that right now. Could you "
                     "please rephrase your car-related question? I'm here to help!"
                 )
-            await send_whatsapp_message(from_number, fallback)
+            await send_whatsapp_message(from_number, fallback, user_message=text)
             print(f"Fallback response sent to {from_number}")
             
     except IntentExtractionError as exc:
@@ -455,7 +858,7 @@ async def process_text_message(from_number: str, text: str, message_id: str):
             "I'm having some technical difficulties understanding your message. "
             "Could you please rephrase your question about cars? I'm here to help!"
         )
-        await send_whatsapp_message(from_number, fallback)
+        await send_whatsapp_message(from_number, fallback, user_message=text)
         
     except ValueError as exc:
         print(f"Invalid message for intent extraction: {exc}")
@@ -464,7 +867,7 @@ async def process_text_message(from_number: str, text: str, message_id: str):
             "I didn't quite catch that. Could you please send me a message "
             "about your car? I'm here to help with car-related questions!"
         )
-        await send_whatsapp_message(from_number, fallback)
+        await send_whatsapp_message(from_number, fallback, user_message=text)
     
     except Exception as exc:
         print(f"Unexpected error processing message: {exc}")
@@ -476,7 +879,7 @@ async def process_text_message(from_number: str, text: str, message_id: str):
             "with a car-related question, and I'll do my best to help!"
         )
         try:
-            await send_whatsapp_message(from_number, fallback)
+            await send_whatsapp_message(from_number, fallback, user_message=text)
         except Exception as send_exc:
             print(f"Failed to send fallback message: {send_exc}")
 
@@ -494,13 +897,24 @@ async def send_whatsapp_message(
     to: str,
     message: str,
     phone_number_id: Optional[str] = None,
-    access_token: Optional[str] = None
+    access_token: Optional[str] = None,
+    user_message: Optional[str] = None
 ):
     """
-    Send a WhatsApp message using Meta's API
+    Send a WhatsApp message using Meta's API and track conversation history.
     This is a helper function - you'll need to implement the actual API call
+    
+    Args:
+        to: Recipient phone number
+        message: Message text (will be validated and sanitized)
+        phone_number_id: Optional phone number ID override
+        access_token: Optional access token override
+        user_message: Optional user message to track in conversation history
     """
     import httpx
+    
+    # Validate and sanitize message before sending
+    validated_message = validate_and_sanitize_response(message)
     
     phone_number_id = phone_number_id or os.getenv("PHONE_NUMBER_ID")
     access_token = access_token or os.getenv("ACCESS_TOKEN")
@@ -521,7 +935,7 @@ async def send_whatsapp_message(
         "to": to,
         "type": "text",
         "text": {
-            "body": message
+            "body": validated_message
         }
     }
     
@@ -530,6 +944,11 @@ async def send_whatsapp_message(
             response = await client.post(url, json=payload, headers=headers)
             response.raise_for_status()
             print(f"Message sent successfully: {response.json()}")
+            
+            # Track conversation history if user message is provided
+            if user_message:
+                conversation_manager.add_message_to_history(to, user_message, validated_message)
+            
             return response.json()
     except httpx.HTTPError as e:
         print(f"Error sending message: {e}")

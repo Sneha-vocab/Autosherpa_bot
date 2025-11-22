@@ -2,7 +2,13 @@
 
 import re
 from typing import Optional, List, Dict, Any
-from conversation_state import conversation_manager, ConversationState
+from conversation_state import (
+    conversation_manager, 
+    ConversationState, 
+    detect_flow_switch,
+    is_exit_request,
+    get_main_menu_message
+)
 from database import car_db, Car
 from intent_service import generate_response
 from browse_car_analyzer import (
@@ -110,6 +116,32 @@ async def extract_car_type_from_message(message: str) -> Optional[str]:
     return None
 
 
+def _transition_to_emi_flow(user_id: str, state: ConversationState) -> str:
+    """Helper function to transition from browse_car flow to EMI flow.
+    
+    Args:
+        user_id: User identifier
+        state: Current conversation state
+    
+    Returns:
+        Flow switch marker string
+    """
+    selected_car = state.data.get("selected_car")
+    conversation_manager.clear_state(user_id)
+    # Store selected car temporarily for EMI flow
+    if selected_car:
+        conversation_manager.set_state(
+            user_id,
+            ConversationState(
+                user_id=user_id,
+                flow_name="emi",
+                step="down_payment",
+                data={"selected_car": selected_car, "down_payment": None, "tenure": None}
+            )
+        )
+    return "__FLOW_SWITCH__:emi"
+
+
 def format_car_list(cars: List[Car]) -> str:
     """Format list of cars for display."""
     if not cars:
@@ -149,20 +181,20 @@ async def handle_browse_car_flow(
     """Handle the browse used car flow with intelligent message analysis."""
     state = conversation_manager.get_state(user_id)
     
+    # Check for flow switch first
+    if intent_result:
+        current_step = state.step if state else None
+        target_flow = detect_flow_switch(intent_result, message, "browse_car", current_step)
+        if target_flow:
+            print(f"Flow switch detected in browse_car_flow: browse_car -> {target_flow}")
+            conversation_manager.clear_state(user_id)
+            # Return special marker that main.py will handle
+            return f"__FLOW_SWITCH__:{target_flow}"
+    
     # Check for exit/back to main menu
-    message_lower = message.lower().strip()
-    exit_keywords = ["back", "menu", "main menu", "exit", "cancel", "quit", "stop", "done"]
-    if any(keyword in message_lower for keyword in exit_keywords):
+    if is_exit_request(message):
         conversation_manager.clear_state(user_id)
-        return (
-            "Sure! How can I help you today? 😊\n\n"
-            "You can:\n"
-            "• Browse used cars\n"
-            "• Get car valuation\n"
-            "• Calculate EMI\n"
-            "• Book a service\n\n"
-            "What would you like to do?"
-        )
+        return get_main_menu_message()
     
     # Get available brands and types from database
     available_brands = await get_brands_from_db()
@@ -245,6 +277,20 @@ async def handle_browse_car_flow(
     
     # Continue based on current step
     state = conversation_manager.get_state(user_id)
+    
+    # Safety check: state should exist after initialization, but verify to prevent AttributeError
+    if not state:
+        # Re-initialize if state is somehow None
+        conversation_manager.set_state(
+            user_id,
+            ConversationState(
+                user_id=user_id,
+                flow_name="browse_car",
+                step="collecting_criteria",
+                data={}
+            )
+        )
+        state = conversation_manager.get_state(user_id)
     
     if state.step == "collecting_criteria":
         # Use intelligent analysis to understand user's message
@@ -344,7 +390,11 @@ async def handle_browse_car_flow(
             
             else:
                 # All criteria collected, search for cars
-                min_price, max_price = budget if budget else (None, None)
+                # Safely unpack budget with type validation
+                if budget and isinstance(budget, tuple) and len(budget) == 2:
+                    min_price, max_price = budget
+                else:
+                    min_price, max_price = None, None
                 
                 try:
                     cars = await car_db.search_cars(
@@ -386,7 +436,13 @@ async def handle_browse_car_flow(
                     return format_car_list(cars)
                     
                 except Exception as e:
-                    return f"I encountered an issue searching for cars. Please try again later. Error: {str(e)}"
+                    print(f"Database error in browse_car_flow (collecting_criteria): {type(e).__name__}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return (
+                        "I encountered an issue searching for cars. "
+                        "Please try again in a moment, or contact us if the problem persists."
+                    )
         
         except BrowseCarAnalysisError as e:
             print(f"Analysis error in collecting_criteria: {e}")
@@ -405,7 +461,11 @@ async def handle_browse_car_flow(
                 return "What type of car are you looking for?"
             else:
                 # All criteria collected, search for cars
-                min_price, max_price = budget if budget else (None, None)
+                # Safely unpack budget with type validation
+                if budget and isinstance(budget, tuple) and len(budget) == 2:
+                    min_price, max_price = budget
+                else:
+                    min_price, max_price = None, None
                 
                 try:
                     cars = await car_db.search_cars(
@@ -428,7 +488,13 @@ async def handle_browse_car_flow(
                     return format_car_list(cars)
                     
                 except Exception as e:
-                    return f"I encountered an issue searching for cars. Please try again later. Error: {str(e)}"
+                    print(f"Database error in browse_car_flow (fallback path): {type(e).__name__}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return (
+                        "I encountered an issue searching for cars. "
+                        "Please try again in a moment, or contact us if the problem persists."
+                    )
     
     elif state.step == "showing_cars":
         # Use intelligent analysis to understand user's message
@@ -550,6 +616,14 @@ async def handle_browse_car_flow(
                 cars_data = state.data.get("cars", [])
                 if 1 <= car_number <= len(cars_data):
                     selected_car = cars_data[car_number - 1]
+                    # Validate selected_car structure
+                    if not isinstance(selected_car, dict):
+                        return "I encountered an issue with the car data. Please try selecting again."
+                    # Ensure required keys exist with defaults
+                    if "brand" not in selected_car:
+                        selected_car["brand"] = "Unknown"
+                    if "model" not in selected_car:
+                        selected_car["model"] = "Unknown"
                     conversation_manager.update_data(user_id, selected_car=selected_car)
                     conversation_manager.update_state(user_id, step="car_selected")
                     return f"Excellent choice! You've selected the *{selected_car.get('brand')} {selected_car.get('model')}* 🎉\n\nWhat would you like to do next?\n\n1️⃣ Book a test drive\n2️⃣ Change search criteria"
@@ -589,22 +663,8 @@ async def handle_browse_car_flow(
             
             if "2" in message_lower or "emi" in message_lower or "loan" in message_lower or "finance" in message_lower or "installment" in message_lower:
                 # User wants to calculate EMI
-                # Transition to EMI flow with selected car
-                from emi_flow import handle_emi_flow
-                # Clear browse car state and initialize EMI flow
-                selected_car = state.data.get("selected_car")
-                conversation_manager.clear_state(user_id)
-                # Initialize EMI flow with selected car
-                conversation_manager.set_state(
-                    user_id,
-                    ConversationState(
-                        user_id=user_id,
-                        flow_name="emi",
-                        step="down_payment",
-                        data={"selected_car": selected_car, "down_payment": None, "tenure": None}
-                    )
-                )
-                return await handle_emi_flow(user_id, message, None)
+                # Store selected car and let main.py handle routing
+                return _transition_to_emi_flow(user_id, state)
             
             if "booking_test_drive" in user_intent or "test drive" in message_lower or "1" in message_lower or "book" in message_lower:
                 conversation_manager.update_state(user_id, step="test_drive_name")
@@ -645,19 +705,7 @@ async def handle_browse_car_flow(
                 return "Sure! Let's start a new search. What are you looking for?"
             if "emi" in message_lower or "loan" in message_lower or "2" in message_lower:
                 # Transition to EMI flow
-                selected_car = state.data.get("selected_car")
-                conversation_manager.clear_state(user_id)
-                from emi_flow import handle_emi_flow
-                conversation_manager.set_state(
-                    user_id,
-                    ConversationState(
-                        user_id=user_id,
-                        flow_name="emi",
-                        step="down_payment",
-                        data={"selected_car": selected_car, "down_payment": None, "tenure": None}
-                    )
-                )
-                return await handle_emi_flow(user_id, message, None)
+                return _transition_to_emi_flow(user_id, state)
             if "test drive" in message_lower or "1" in message_lower or "book" in message_lower:
                 conversation_manager.update_state(user_id, step="test_drive_name")
                 return "Perfect! Let's get your test drive booked! 🚗💨\n\nTo get started, could you please share your name?"
@@ -862,12 +910,23 @@ async def handle_browse_car_flow(
         if not selected_car:
             return "I'm sorry, there was an error. Please start over."
         
+        # Validate selected_car structure and ensure required fields exist
+        if not isinstance(selected_car, dict):
+            return "I'm sorry, there was an error with the car data. Please start over."
+        
+        car_id = selected_car.get("id")
+        if not car_id:
+            return "I'm sorry, there was an error. The car ID is missing. Please start over."
+        
         # Create booking
         try:
+            if not car_db:
+                return "Database connection is not available. Please try again later."
+            
             booking_id = await car_db.create_test_drive_booking(
                 user_name=test_drive_data.get("test_drive_name"),
                 phone_number=test_drive_data.get("test_drive_phone"),
-                car_id=selected_car["id"],
+                car_id=car_id,
                 has_dl=test_drive_data.get("test_drive_has_dl", False),
                 location_type=location_type
             )

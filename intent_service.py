@@ -52,6 +52,9 @@ class IntentResult:
 async def extract_intent(
     message_text: str,
     *,
+    conversation_context: Optional[str] = None,
+    current_flow: Optional[str] = None,
+    current_step: Optional[str] = None,
     model: Optional[str] = None,
     timeout: float = 12.0,
     client: Optional[httpx.AsyncClient] = None,
@@ -82,13 +85,21 @@ async def extract_intent(
     resolved_model = model or os.getenv("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
     url = _API_URL_TEMPLATE.format(model=resolved_model)
 
+    # Build prompt with context if available
+    prompt_text = _build_prompt(
+        message_text.strip(),
+        conversation_context=conversation_context,
+        current_flow=current_flow,
+        current_step=current_step
+    )
+
     payload = {
         "contents": [
             {
                 "role": "user",
                 "parts": [
                     {
-                        "text": _build_prompt(message_text.strip()),
+                        "text": prompt_text,
                     }
                 ],
             }
@@ -144,16 +155,43 @@ async def extract_intent(
     return IntentResult.from_payload(parsed)
 
 
-def _build_prompt(message: str) -> str:
-    return (
+def _build_prompt(
+    message: str,
+    conversation_context: Optional[str] = None,
+    current_flow: Optional[str] = None,
+    current_step: Optional[str] = None
+) -> str:
+    prompt = (
         "You are a precise intent extraction service. "
         "Given the following user message, identify the user's intent, "
         "summarise it in a single sentence, estimate a confidence score between 0 and 1, "
         "and extract key entities as a JSON dictionary.\n\n"
+    )
+    
+    # Add conversation context if available
+    if conversation_context:
+        prompt += f"Recent conversation context:\n{conversation_context}\n\n"
+    
+    # Add current flow/step context
+    if current_flow:
+        prompt += f"Current flow: {current_flow}"
+        if current_step:
+            prompt += f", Step: {current_step}"
+        prompt += "\n\n"
+        prompt += (
+            "IMPORTANT: If the user's message is a short response (like 'yes', 'no', 'change', "
+            "or a single word/number), it's likely an answer to a question within the current flow. "
+            "Do NOT interpret it as a request to switch to a different flow. "
+            "Extract the intent based on the conversation context.\n\n"
+        )
+    
+    prompt += (
         "Return your answer as compact JSON with exactly the keys: intent (string), "
         "summary (string), confidence (float between 0 and 1), entities (object mapping).\n\n"
         f"User message: {message}"
     )
+    
+    return prompt
 
 
 def extract_intent_sync(message_text: str, **kwargs: Any) -> IntentResult:

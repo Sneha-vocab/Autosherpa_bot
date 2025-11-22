@@ -3,7 +3,13 @@
 import re
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from conversation_state import conversation_manager, ConversationState
+from conversation_state import (
+    conversation_manager, 
+    ConversationState, 
+    detect_flow_switch,
+    is_exit_request,
+    get_main_menu_message
+)
 from database import car_db
 from intent_service import generate_response
 from car_valuation_analyzer import (
@@ -270,20 +276,20 @@ async def handle_car_valuation_flow(
     """Handle the car valuation flow with intelligent message analysis."""
     state = conversation_manager.get_state(user_id)
     
+    # Check for flow switch first
+    if intent_result:
+        current_step = state.step if state else None
+        target_flow = detect_flow_switch(intent_result, message, "car_valuation", current_step)
+        if target_flow:
+            print(f"Flow switch detected in car_valuation_flow: car_valuation -> {target_flow}")
+            conversation_manager.clear_state(user_id)
+            # Return special marker that main.py will handle
+            return f"__FLOW_SWITCH__:{target_flow}"
+    
     # Check for exit/back to main menu
-    message_lower = message.lower().strip()
-    exit_keywords = ["back", "menu", "main menu", "exit", "cancel", "quit", "stop", "done"]
-    if any(keyword in message_lower for keyword in exit_keywords):
+    if is_exit_request(message):
         conversation_manager.clear_state(user_id)
-        return (
-            "Sure! How can I help you today? 😊\n\n"
-            "You can:\n"
-            "• Browse used cars\n"
-            "• Get car valuation\n"
-            "• Calculate EMI\n"
-            "• Book a service\n\n"
-            "What would you like to do?"
-        )
+        return get_main_menu_message()
     
     # Get available brands and fuel types from database
     available_brands = await get_brands_from_db()
@@ -375,6 +381,20 @@ async def handle_car_valuation_flow(
     # Continue based on current step
     state = conversation_manager.get_state(user_id)
     
+    # Safety check: state should exist after initialization, but verify to prevent AttributeError
+    if not state:
+        # Re-initialize if state is somehow None
+        conversation_manager.set_state(
+            user_id,
+            ConversationState(
+                user_id=user_id,
+                flow_name="car_valuation",
+                step="collecting_info",
+                data={}
+            )
+        )
+        state = conversation_manager.get_state(user_id)
+    
     if state.step == "collecting_info":
         # Use intelligent analysis to understand user's message
         try:
@@ -425,14 +445,29 @@ async def handle_car_valuation_flow(
                 condition=condition
             )
             
-            # Ensure values are not empty strings
-            brand = brand.strip() if brand and isinstance(brand, str) else brand
-            model = model.strip() if model and isinstance(model, str) else model
-            fuel_type = fuel_type.strip() if fuel_type and isinstance(fuel_type, str) else fuel_type
-            condition = condition.strip() if condition and isinstance(condition, str) else condition
+            # Ensure values are not empty strings - validate and normalize
+            if brand and isinstance(brand, str):
+                brand = brand.strip()
+            elif brand and not isinstance(brand, str):
+                brand = str(brand).strip() if brand else None
+            
+            if model and isinstance(model, str):
+                model = model.strip()
+            elif model and not isinstance(model, str):
+                model = str(model).strip() if model else None
+            
+            if fuel_type and isinstance(fuel_type, str):
+                fuel_type = fuel_type.strip()
+            elif fuel_type and not isinstance(fuel_type, str):
+                fuel_type = str(fuel_type).strip() if fuel_type else None
+            
+            if condition and isinstance(condition, str):
+                condition = condition.strip()
+            elif condition and not isinstance(condition, str):
+                condition = str(condition).strip() if condition else None
             
             # Check what's missing
-            if not brand or brand == "":
+            if not brand or (isinstance(brand, str) and brand == ""):
                 try:
                     response = await generate_valuation_response(
                         message=message,
@@ -450,7 +485,7 @@ async def handle_car_valuation_flow(
                     brands_list = ", ".join(available_brands[:5]) if available_brands else ""
                     return f"Which brand is your car? (e.g., {brands_list})" if brands_list else "Which brand is your car?"
             
-            elif not model or model == "":
+            elif not model or (isinstance(model, str) and model == ""):
                 try:
                     response = await generate_valuation_response(
                         message=message,
@@ -484,7 +519,7 @@ async def handle_car_valuation_flow(
                     print(f"Error generating response: {e}")
                     return f"What year was your {brand} {model} manufactured?"
             
-            elif not fuel_type or fuel_type == "":
+            elif not fuel_type or (isinstance(fuel_type, str) and fuel_type == ""):
                 try:
                     response = await generate_valuation_response(
                         message=message,
@@ -502,7 +537,7 @@ async def handle_car_valuation_flow(
                     fuel_list = ", ".join(available_fuel_types)
                     return f"What's the fuel type? (e.g., {fuel_list})"
             
-            elif not condition or condition == "":
+            elif not condition or (isinstance(condition, str) and condition == ""):
                 try:
                     response = await generate_valuation_response(
                         message=message,
@@ -525,7 +560,7 @@ async def handle_car_valuation_flow(
                 if not brand or not year or not fuel_type or not condition:
                     return "I need all the information to calculate the valuation. Please provide brand, year, fuel type, and condition."
                 
-                if not model or model == "":
+                if not model or (isinstance(model, str) and model == ""):
                     model = "Unknown Model"  # Default if model not provided
                 
                 # Validate year is reasonable
@@ -584,14 +619,14 @@ async def handle_car_valuation_flow(
                 return f"What year was your {brand} {model} manufactured?"
             elif not fuel_type:
                 return "What's the fuel type?"
-            elif not condition or condition == "":
+            elif not condition or (isinstance(condition, str) and condition == ""):
                 return "How would you describe the condition?"
             else:
                 # All information collected
                 if not brand or not year or not fuel_type or not condition:
                     return "I need all the information to calculate the valuation. Please provide brand, year, fuel type, and condition."
                 
-                if not model or model == "":
+                if not model or (isinstance(model, str) and model == ""):
                     model = "Unknown Model"
                 
                 # Validate year

@@ -3,7 +3,13 @@
 import re
 import math
 from typing import Optional, List, Dict, Any
-from conversation_state import conversation_manager, ConversationState
+from conversation_state import (
+    conversation_manager, 
+    ConversationState, 
+    detect_flow_switch,
+    is_exit_request,
+    get_main_menu_message
+)
 from database import car_db, Car
 from intent_service import generate_response
 from emi_analyzer import (
@@ -204,20 +210,20 @@ async def handle_emi_flow(
     """Handle the EMI calculation flow with intelligent message analysis."""
     state = conversation_manager.get_state(user_id)
     
+    # Check for flow switch first
+    if intent_result:
+        current_step = state.step if state else None
+        target_flow = detect_flow_switch(intent_result, message, "emi", current_step)
+        if target_flow:
+            print(f"Flow switch detected in emi_flow: emi -> {target_flow}")
+            conversation_manager.clear_state(user_id)
+            # Return special marker that main.py will handle
+            return f"__FLOW_SWITCH__:{target_flow}"
+    
     # Check for exit/back to main menu
-    message_lower = message.lower().strip()
-    exit_keywords = ["back", "menu", "main menu", "exit", "cancel", "quit", "stop", "done"]
-    if any(keyword in message_lower for keyword in exit_keywords):
+    if is_exit_request(message):
         conversation_manager.clear_state(user_id)
-        return (
-            "Sure! How can I help you today? 😊\n\n"
-            "You can:\n"
-            "• Browse used cars\n"
-            "• Get car valuation\n"
-            "• Calculate EMI\n"
-            "• Book a service\n\n"
-            "What would you like to do?"
-        )
+        return get_main_menu_message()
     
     # Get available brands from database
     available_brands = await get_brands_from_db()
@@ -327,6 +333,20 @@ async def handle_emi_flow(
     
     # Continue based on current step
     state = conversation_manager.get_state(user_id)
+    
+    # Safety check: state should exist after initialization, but verify to prevent AttributeError
+    if not state:
+        # Re-initialize if state is somehow None
+        conversation_manager.set_state(
+            user_id,
+            ConversationState(
+                user_id=user_id,
+                flow_name="emi",
+                step="selecting_car",
+                data={}
+            )
+        )
+        state = conversation_manager.get_state(user_id)
     
     if state.step == "selecting_car":
         # User needs to select a car

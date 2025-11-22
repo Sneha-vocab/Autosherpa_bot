@@ -3,7 +3,13 @@
 import re
 from typing import Optional, List, Dict, Any
 from datetime import datetime
-from conversation_state import conversation_manager, ConversationState
+from conversation_state import (
+    conversation_manager, 
+    ConversationState, 
+    detect_flow_switch,
+    is_exit_request,
+    get_main_menu_message
+)
 from database import car_db
 from intent_service import generate_response
 from service_booking_analyzer import (
@@ -164,22 +170,22 @@ async def handle_service_booking_flow(
     """Handle the service booking flow with intelligent message analysis."""
     state = conversation_manager.get_state(user_id)
     
+    # Check for flow switch first
+    if intent_result:
+        current_step = state.step if state else None
+        target_flow = detect_flow_switch(intent_result, message, "service_booking", current_step)
+        if target_flow:
+            print(f"Flow switch detected in service_booking_flow: service_booking -> {target_flow}")
+            conversation_manager.clear_state(user_id)
+            # Return special marker that main.py will handle
+            return f"__FLOW_SWITCH__:{target_flow}"
+    
     # Check for exit/back to main menu (check early, but allow option 4 in showing_services step)
-    message_lower = message.lower().strip()
     # Only check for exit if not in showing_services step (where option 4 is handled)
     if state and state.step != "showing_services":
-        exit_keywords = ["back", "menu", "main menu", "exit", "cancel", "quit", "stop", "done"]
-        if any(keyword in message_lower for keyword in exit_keywords):
+        if is_exit_request(message):
             conversation_manager.clear_state(user_id)
-            return (
-                "Sure! How can I help you today? 😊\n\n"
-                "You can:\n"
-                "• Browse used cars\n"
-                "• Get car valuation\n"
-                "• Calculate EMI\n"
-                "• Book a service\n\n"
-                "What would you like to do?"
-            )
+            return get_main_menu_message()
     
     # Get available brands from database
     available_brands = await get_brands_from_db()
@@ -200,6 +206,20 @@ async def handle_service_booking_flow(
     
     # Continue based on current step
     state = conversation_manager.get_state(user_id)
+    
+    # Safety check: state should exist after initialization, but verify to prevent AttributeError
+    if not state:
+        # Re-initialize if state is somehow None
+        conversation_manager.set_state(
+            user_id,
+            ConversationState(
+                user_id=user_id,
+                flow_name="service_booking",
+                step="showing_services",
+                data={}
+            )
+        )
+        state = conversation_manager.get_state(user_id)
     
     if state.step == "showing_services":
         # User selecting a service or option
@@ -249,10 +269,9 @@ async def handle_service_booking_flow(
                 )
         
         elif message_lower in ["2", "browse", "browse cars", "used cars"]:
-            # Route to browse cars
+            # Route to browse cars - clear state and let main.py handle routing
             conversation_manager.clear_state(user_id)
-            from browse_car_flow import handle_browse_car_flow
-            return await handle_browse_car_flow(user_id, "I want to browse cars", None)
+            return "__FLOW_SWITCH__:browse_car"
         
         elif message_lower in ["3", "talk", "team", "contact"]:
             # Talk to team
@@ -737,23 +756,27 @@ async def handle_service_booking_flow(
                 
                 # Create booking in database
                 try:
-                    if car_db:
-                        booking_id = await car_db.create_service_booking(
-                            customer_name=customer_name,
-                            phone_number=phone,
-                            make=booking_data["make"],
-                            model=booking_data["model"],
-                            year=booking_data["year"],
-                            registration_number=booking_data["registration_number"],
-                            service_type=booking_data["service_type"]
-                        )
-                        booking_data["booking_id"] = booking_id
-                    else:
-                        booking_data["booking_id"] = f"SB{datetime.now().strftime('%Y%m%d%H%M%S')}"
+                    if not car_db:
+                        return "Database connection is not available. Please try again later."
+                    
+                    booking_id = await car_db.create_service_booking(
+                        customer_name=customer_name,
+                        phone_number=phone,
+                        make=booking_data["make"],
+                        model=booking_data["model"],
+                        year=booking_data["year"],
+                        registration_number=booking_data["registration_number"],
+                        service_type=booking_data["service_type"]
+                    )
+                    booking_data["booking_id"] = booking_id
                 except Exception as e:
-                    print(f"Error creating service booking: {e}")
-                    booking_data["booking_id"] = f"SB{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    return f"I encountered an error booking your service. Please try again or contact us directly. Error: {str(e)}"
+                    print(f"Database error in service_booking_flow: {type(e).__name__}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return (
+                        "I encountered an error booking your service. "
+                        "Please try again in a moment, or contact us directly if the problem persists."
+                    )
                 
                 # Clear state
                 conversation_manager.clear_state(user_id)
@@ -809,9 +832,13 @@ async def handle_service_booking_flow(
                     else:
                         booking_data["booking_id"] = f"SB{datetime.now().strftime('%Y%m%d%H%M%S')}"
                 except Exception as e:
-                    print(f"Error creating service booking: {e}")
-                    booking_data["booking_id"] = f"SB{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    return f"I encountered an error booking your service. Please try again or contact us directly. Error: {str(e)}"
+                    print(f"Database error in service_booking_flow (Exception fallback): {type(e).__name__}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return (
+                        "I encountered an error booking your service. "
+                        "Please try again in a moment, or contact us directly if the problem persists."
+                    )
                 
                 conversation_manager.clear_state(user_id)
                 return format_service_booking_confirmation(booking_data)
@@ -864,9 +891,13 @@ async def handle_service_booking_flow(
                     else:
                         booking_data["booking_id"] = f"SB{datetime.now().strftime('%Y%m%d%H%M%S')}"
                 except Exception as e:
-                    print(f"Error creating service booking: {e}")
-                    booking_data["booking_id"] = f"SB{datetime.now().strftime('%Y%m%d%H%M%S')}"
-                    return f"I encountered an error booking your service. Please try again or contact us directly. Error: {str(e)}"
+                    print(f"Database error in service_booking_flow (final fallback): {type(e).__name__}: {str(e)}")
+                    import traceback
+                    traceback.print_exc()
+                    return (
+                        "I encountered an error booking your service. "
+                        "Please try again in a moment, or contact us directly if the problem persists."
+                    )
                 
                 conversation_manager.clear_state(user_id)
                 return format_service_booking_confirmation(booking_data)
